@@ -15,6 +15,26 @@
 //   On final retry exhaustion handled by Cloudflare → message lands in DLQ.
 //   DLQ consumer (future work) will refund there; for now ops watches the DLQ.
 
+// ============================================================================
+// CONCURRENT-WRITE RISK (KNOWN, INHERITED FROM PAGES, NOT MITIGATED HERE)
+// ============================================================================
+// Cloudflare KV has no compare-and-swap. The consumer's refund-on-failure
+// performs read-modify-write on token_balance:{userId}. A concurrent Stripe
+// purchase webhook can collide on the same record. Worst case: a sub-second
+// timing window where both read pre-update balance and the slower writer
+// overwrites the faster writer's update — losing one operation.
+//
+// This race exists on the synchronous code path today (Pages-side creditTokens
+// has the same read-modify-write pattern). The consumer does not introduce
+// new risk; it slightly extends the window because the refund now runs after
+// the queue+consumer roundtrip rather than synchronously inside the producer
+// request. Acceptable inheritance for v1.
+//
+// Future fix: migrate token_balance to Durable Objects (atomic per-userId
+// instance) or D1 (transactional writes). Tracked separately. Do NOT block
+// this build on it.
+// ============================================================================
+
 import type { JobMessage, JobState, Env } from './types';
 import { callRd, callRdAnimateWithFallback, RdError } from './rdClient';
 import { refundTokens } from './refund';
