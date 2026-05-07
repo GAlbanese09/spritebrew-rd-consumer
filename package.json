@@ -1,0 +1,19 @@
+{
+  "name": "spritebrew-rd-consumer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Queues consumer that calls Retro Diffusion for SpriteBrew sprite generation jobs.",
+  "scripts": {
+    "deploy:dev": "wrangler deploy --env preview",
+    "deploy:prod": "wrangler deploy --env production",
+    "tail:dev": "wrangler tail spritebrew-rd-consumer-dev",
+    "tail:prod": "wrangler tail spritebrew-rd-consumer",
+    "types": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "typescript": "^5.3.0",
+    "wrangler": "^4.0.0"
+  }
+}

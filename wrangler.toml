@@ -1,0 +1,44 @@
+# spritebrew-rd-consumer/wrangler.toml
+# Established 2026-05-07 — Session 15 continued morning.
+# Architectural reference: Confluence 87490562 + 87588866.
+
+name = "spritebrew-rd-consumer"
+main = "src/index.ts"
+compatibility_date = "2026-04-03"
+compatibility_flags = ["nodejs_compat"]
+
+[limits]
+cpu_ms = 300000  # 5 min defensive headroom (RD calls take 90-120s wall-clock; CPU is near-zero since await fetch is I/O wait)
+
+# === Production ===
+[env.production]
+name = "spritebrew-rd-consumer"
+
+[[env.production.queues.consumers]]
+queue = "spritebrew-rd-jobs"
+max_batch_size = 1                  # one RD call per invocation
+max_batch_timeout = 0               # don't wait to batch
+max_retries = 3                     # try original + 3 retries before DLQ
+dead_letter_queue = "spritebrew-rd-jobs-dlq"
+
+[[env.production.kv_namespaces]]
+binding = "SPRITEBREW_KV"
+id = "ed99497beaaa432f88000689ab78821c"
+
+# RETRO_DIFFUSION_API_KEY set via:
+#   npx wrangler secret put RETRO_DIFFUSION_API_KEY --env production
+
+# === Preview/dev ===
+[env.preview]
+name = "spritebrew-rd-consumer-dev"
+
+[[env.preview.queues.consumers]]
+queue = "spritebrew-rd-jobs-dev"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 3
+dead_letter_queue = "spritebrew-rd-jobs-dlq-dev"
+
+[[env.preview.kv_namespaces]]
+binding = "SPRITEBREW_KV"
+id = "18dd9502fdde4a2ea76f9b9eb9cc5e8b"
