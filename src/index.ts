@@ -38,6 +38,7 @@
 import type { JobMessage, JobState, Env } from './types';
 import { callRd, callRdAnimateWithFallback, RdError } from './rdClient';
 import { refundTokens } from './refund';
+import { base64ToBytes, writeGalleryEntry } from './gallery';
 
 const JOB_TTL_S = 60 * 60;           // 1h — long enough that a refresh recovers; short enough to bound storage.
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a 'running' job is older than this, treat as orphaned.
@@ -83,8 +84,45 @@ async function handleMessage(
   const stateRaw = await env.SPRITEBREW_KV.get(stateKey);
   const state = stateRaw ? (JSON.parse(stateRaw) as JobState) : null;
 
-  if (state?.status === 'success' || state?.status === 'error') {
-    log('info', 'job already terminal; acking', { existingStatus: state.status });
+  if (state?.status === 'success') {
+    // Self-healing: re-write the gallery entry in case a previous attempt
+    // wrote `job:` but the gallery write didn't land (or only partially did).
+    // R2 put + KV put on jobId-derived keys are both overwrite-safe, so this
+    // is a no-op when the gallery already exists and corrective when it
+    // doesn't. Failure → msg.retry() so the gallery eventually catches up;
+    // never falls through to the outer catch (which would refund a job RD
+    // already produced).
+    try {
+      const pngBytes = base64ToBytes(state.resultBase64);
+      await writeGalleryEntry(
+        env,
+        {
+          jobId,
+          userId,
+          pngBytes,
+          prompt: body.prompt,
+          style: body.prompt_style,
+          mode,
+          createdAt: state.completedAt,
+        },
+        log
+      );
+    } catch (galleryErr) {
+      log('error', 'self-healing gallery write failed; retrying message', {
+        error: galleryErr instanceof Error ? galleryErr.message : String(galleryErr),
+      });
+      msg.retry();
+      return;
+    }
+    log('info', 'job already terminal (success); self-heal complete; acking');
+    msg.ack();
+    return;
+  }
+
+  if (state?.status === 'error') {
+    log('info', 'job already terminal (error); acking', {
+      existingStatus: state.status,
+    });
     msg.ack();
     return;
   }
@@ -126,6 +164,34 @@ async function handleMessage(
       rdLatencyMs: completedAt - startedAt,
       rdBalanceCost: result.balance_cost,
     });
+
+    // Gallery write FIRST (R2 PNG + KV gen: index). Tight nested try/catch:
+    // a failure here calls msg.retry() directly and MUST NOT fall through
+    // to the outer catch — the outer catch can refund tokens, and a
+    // post-RD failure on a generation RD already produced must not be
+    // double-refunded on the eventual retry.
+    try {
+      const pngBytes = base64ToBytes(result.base64_images[0]);
+      await writeGalleryEntry(
+        env,
+        {
+          jobId,
+          userId,
+          pngBytes,
+          prompt: body.prompt,
+          style: body.prompt_style,
+          mode,
+          createdAt: completedAt,
+        },
+        log
+      );
+    } catch (galleryErr) {
+      log('error', 'gallery write failed; retrying message', {
+        error: galleryErr instanceof Error ? galleryErr.message : String(galleryErr),
+      });
+      msg.retry();
+      return;
+    }
 
     const successState: JobState = {
       status: 'success',

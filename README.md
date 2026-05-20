@@ -81,16 +81,29 @@ Watch the structured logs — every line is JSON with `jobId`, `userId`, `attemp
 3. If the job hit terminal `error` and `refunded: true`, check the user's balance via `token_balance:{userId}`.
 4. If a customer reports a failed gen with no refund, check `token_idempotency:refund:{jobId}` — present means refund landed; absent means the failure happened before reaching the refund branch (look for DLQ messages).
 
-## KV keys this Worker writes
+## Storage this Worker writes
+
+### KV keys
 
 | Key                                          | Shape                                                          | TTL  |
 |----------------------------------------------|----------------------------------------------------------------|------|
 | `job:{jobId}`                                | `JobState` (running / success / error)                         | 1h   |
-| `token_balance:{userId}`                     | `{ balance: number, updatedAt: number }`                       | none |
-| `token_idempotency:refund:{jobId}`           | `{ amount: number, ts: number }`                               | 7d   |
-| `token_tx:{userId}:{ts}:{uid}`               | TokenTransaction (refund log)                                  | 90d  |
+| `gen:{userId}:{invTs}:{jobId}`               | Value: empty string. Metadata: `GalleryEntryV1` (≤1024 bytes)  | none |
+| `token_balance:{userId}`                     | `BalanceRecord` (`{ balance, created_at, last_updated }`)      | none |
+| `token_idempotency:refund:{jobId}`           | Literal string `'1'`                                           | 7d   |
+| `token_tx:{userId}:{ts}:{uid}`               | `TokenTransaction` (refund log)                                | 90d  |
+
+`invTs` = `Number.MAX_SAFE_INTEGER - createdAt` (inverted timestamp, makes lexicographic `KV.list()` order newest-first without a sort). `GalleryEntryV1` is defined in `src/types.ts` and is a cross-repo contract with the Pages app's read endpoint.
 
 The producer (Pages) writes `job:{jobId}` initially as `pending` and writes `token_idempotency:gen:{...}` for the debit half. This Worker only writes the refund half.
+
+### R2 objects
+
+| Bucket binding    | Key                          | Content              |
+|-------------------|------------------------------|----------------------|
+| `GALLERY_BUCKET`  | `{userId}/{jobId}.png`       | PNG, `image/png`     |
+
+Bucket name: `spritebrew-gallery` in production, `spritebrew-gallery-dev` in dev/preview. Private; all reads go through authenticated Pages routes.
 
 ## Schema contract
 

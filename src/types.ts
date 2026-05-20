@@ -80,3 +80,29 @@ export interface Env {
   GALLERY_BUCKET: R2Bucket;
   RETRO_DIFFUSION_API_KEY: string;
 }
+
+/**
+ * SCHEMA CONTRACT — GalleryEntryV1
+ *
+ * KV row stored as METADATA on `gen:{userId}:{invTs}:{jobId}` keys. Value of
+ * the KV entry is the empty string; the row lives in the metadata field so
+ * `KV.list()` can return rows without a second `get` per entry. Metadata
+ * must serialize to ≤1024 bytes — the row at max prompt length is well
+ * under that.
+ *
+ * Cross-repo: the Pages app's gallery read endpoint (Phase 3) will have its
+ * own copy of this type and must stay in sync. If you change the shape on
+ * either side, update both files in the same PR and bump the "Last schema
+ * review" date below.
+ *
+ * Last schema review: 2026-05-20 (Day-9, Phase 2)
+ */
+export interface GalleryEntryV1 {
+  jobId: string;
+  prompt: string;              // truncated to first 300 chars
+  style: string;               // RD wire form, e.g. rd_pro__fantasy
+  mode: JobMode;               // 'create' | 'animate'
+  action?: string;             // animate-only; suffix of prompt_style
+  createdAt: number;           // ms epoch; sourced from completedAt
+  v: 1;                        // schema version
+}
