@@ -77,5 +77,6 @@ export type JobState =
 /** Bindings injected by Cloudflare Workers runtime. */
 export interface Env {
   SPRITEBREW_KV: KVNamespace;
+  GALLERY_BUCKET: R2Bucket;
   RETRO_DIFFUSION_API_KEY: string;
 }
