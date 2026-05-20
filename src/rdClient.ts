@@ -59,6 +59,10 @@ export async function callRd(
     headers: {
       'Content-Type': 'application/json',
       'X-RD-Token': apiKey,
+      // Explicit UA + Accept: RD's CF edge 403s the default Worker UA.
+      // Diagnostic confirmed cf-ray + server:cloudflare on the 403 page.
+      'User-Agent': 'spritebrew-rd-consumer/0.1.0 (+https://spritebrew.com)',
+      'Accept': 'application/json, */*',
     },
     body: JSON.stringify(body),
   });
