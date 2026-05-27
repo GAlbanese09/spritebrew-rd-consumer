@@ -54,24 +54,52 @@ export async function callRd(
   _mode: RdMode,
   body: RdCreateBody | RdAnimateBody
 ): Promise<RdSuccessResponse> {
-  const resp = await fetch(RD_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-RD-Token': apiKey,
-      // Explicit UA + Accept: RD's CF edge 403s the default Worker UA.
-      // Diagnostic confirmed cf-ray + server:cloudflare on the 403 page.
-      'User-Agent': 'spritebrew-rd-consumer/0.1.0 (+https://spritebrew.com)',
-      'Accept': 'application/json, */*',
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await resp.text();
+  let resp: Response;
+  let text: string;
+  try {
+    resp = await fetch(RD_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-RD-Token': apiKey,
+        // Explicit UA + Accept: RD's CF edge 403s the default Worker UA.
+        // Diagnostic confirmed cf-ray + server:cloudflare on the 403 page.
+        'User-Agent': 'spritebrew-rd-consumer/0.1.0 (+https://spritebrew.com)',
+        'Accept': 'application/json, */*',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000), // 60s fail-fast on hung connections
+    });
+    text = await resp.text();
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'TimeoutError') {
+      throw new RdError('RD request timed out after 60s', 0, true, '');
+    }
+    throw err; // re-throw network errors, etc.
+  }
 
   if (!resp.ok) {
     // 429 and 5xx are retryable; 4xx (except 429) are not — likely a bad payload.
-    const retryable = resp.status === 429 || resp.status >= 500;
+    let retryable = resp.status === 429 || resp.status >= 500;
+
+    // Narrow rule: RD's "inference_failed" 400s are observed to be transient
+    // upstream failures (RD's own model worker pool returning an error), not
+    // genuine client-side input errors. Per the RD Reliability + Escalation
+    // Runbook, retry these.
+    if (resp.status === 400 && !retryable) {
+      try {
+        const parsed = JSON.parse(text);
+        if (
+          parsed?.detail?.code === 'inference_failed' &&
+          parsed?.detail?.message === 'Unable to run inference.'
+        ) {
+          retryable = true;
+        }
+      } catch {
+        // text wasn't JSON — leave retryable as-is (false for 400)
+      }
+    }
+
     throw new RdError(
       `RD ${resp.status}: ${text.slice(0, 500)}`,
       resp.status,
@@ -116,14 +144,13 @@ export async function callRdAnimateWithFallback(
     return await callRd(apiKey, 'animate', body);
   } catch (err) {
     if (err instanceof RdError && body.prompt_style.startsWith('rd_advanced_animation__')) {
-      console.warn(
-        '[rdClient] rd_advanced_animation__ failed; falling back to animation__any_animation',
-        JSON.stringify({
-          originalStyle: body.prompt_style,
-          status: err.status,
-          message: err.message,
-        })
-      );
+      console.warn(JSON.stringify({
+        level: 'warn',
+        message: 'rd_advanced_animation__ failed; falling back to animation__any_animation',
+        originalStyle: body.prompt_style,
+        fallbackStyle: 'animation__any_animation',
+        errMsg: err instanceof Error ? err.message : String(err),
+      }));
       const fallbackBody: RdAnimateBody = {
         ...body,
         prompt_style: 'animation__any_animation',
