@@ -128,6 +128,20 @@ export async function callRdAnimateWithFallback(
         ...body,
         prompt_style: 'animation__any_animation',
       };
+      // Shed remove_bg on the last-resort retry. The July 7 direct-API test
+      // confirmed RD honors remove_bg on rd_advanced_animation__* only;
+      // animation__any_animation was never tested with the parameter, so
+      // forwarding it on the fallback risks turning a graceful opaque-plus-
+      // banner degradation into a hard 4xx that consumes the max_retries
+      // budget and DLQs the job. The retry of last resort sends the most
+      // conservative, battle-tested wire shape we know. remove_bg is not
+      // declared on RdAnimateBody (see interface above); the runtime
+      // property is present on the enqueued body whenever the producer's
+      // animate-path transparent-background toggle was ON, so a scoped
+      // cast is needed to strip it. Mirrors the producer's runAnimate
+      // fallback (spritebrew/src/app/api/generate/route.ts) which does
+      // `delete payload.remove_bg` in the same catch block.
+      delete (fallbackBody as RdAnimateBody & { remove_bg?: boolean }).remove_bg;
       return await callRd(apiKey, 'animate', fallbackBody);
     }
     throw err;
