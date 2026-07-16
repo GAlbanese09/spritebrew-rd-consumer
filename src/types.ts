@@ -25,6 +25,15 @@ export interface JobMessage {
    *  to RD. Typed as a union so callRd accepts it without further casting. */
   body: RdCreateBody | RdAnimateBody;
   enqueuedAt: number;
+  /** Optional 64×64 opaque PNG base64 (no data: prefix). When present AND
+   *  the animate primary attempt fails on rd_advanced_animation__*, the
+   *  fallback uses this instead of body.input_image because
+   *  animation__any_animation is 64×64-locked (probe C5: deterministic 400
+   *  on oversized inputs). When absent AND body.width > 64, the fallback
+   *  is skipped entirely and the primary's error propagates unchanged.
+   *  Producer ships this in a later deploy; today it is always undefined
+   *  and the >64px case simply loses fallback coverage. */
+  fallbackInputImage?: string;
 }
 
 export type JobStatus = 'pending' | 'running' | 'success' | 'error';
@@ -43,6 +52,22 @@ export interface JobStateRunning {
   enqueuedAt: number;
   startedAt: number;
   attempt: number;
+  /**
+   * Set immediately BEFORE the async submit fetch fires (animate/async path
+   * only). Purpose is redelivery-safety billing: if a message is redelivered
+   * and this marker is present but taskId is absent, the previous invocation
+   * threw during submit — RD may or may not have created a task, and there
+   * is no recovery path (probe: GET /v1/inferences/tasks returns 404, no
+   * listing endpoint; RD documents no idempotency keys). We MUST NOT
+   * resubmit. Absent on the create path (which is still sync).
+   */
+  submitAttemptedAt?: number;
+  /**
+   * Set immediately AFTER the async submit response yields a task_id
+   * (animate/async path only). On redelivery with this present + no terminal
+   * status, resume polling this exact task; do not resubmit.
+   */
+  taskId?: string;
 }
 
 export interface JobStateSuccess {
