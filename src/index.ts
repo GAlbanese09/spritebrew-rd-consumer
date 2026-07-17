@@ -13,6 +13,8 @@
 //   0. Read job:{jobId} from KV.
 //      - Terminal (success/error)                              → ack (idempotent).
 //      - Running + taskId (any mode wired async)               → resume poll.
+//        If that state also carries a `rescue` marker, the task is a
+//        fallback's and the resumed delivery is marked as a rescue too.
 //      - Running + submitAttemptedAt + !taskId                 → orphaned submit
 //        (RD may have accepted our body but we lost the id; there is NO
 //        recovery path — GET /v1/inferences/tasks 404s per probe). Refund
@@ -99,17 +101,21 @@ function errText(err: unknown): string {
 }
 
 /**
- * Rescue descriptor for a delivery that came from the animate fallback.
- * Built at the fallback's success site (the only place that knows both what
- * was asked for and what came back) and threaded into recordSuccess, which
- * writes it onto the success record. The client reads `rescued` explicitly
- * rather than inferring a rescue from geometry.
+ * The half of a rescue that is known at fallback-SUBMIT time and survives a
+ * crash: what the user asked for, and what we clamped to. Persisted onto the
+ * running state alongside the fallback's taskId. Derived from the state type
+ * so the two can't drift apart.
  */
-interface RescueInfo {
+type RescueMarker = NonNullable<JobStateRunning['rescue']>;
+
+/**
+ * Rescue descriptor for a delivery that came from the animate fallback: the
+ * persisted marker plus the geometry that only exists once the sheet lands.
+ * Threaded into recordSuccess, which writes it onto the success record. The
+ * client reads `rescued` explicitly rather than inferring it from geometry.
+ */
+interface RescueInfo extends RescueMarker {
   rescued: true;
-  requestedWidth: number;
-  requestedHeight: number;
-  deliveredCellSize: number;
   deliveredFrames?: number;
 }
 
@@ -178,6 +184,51 @@ function deliveredFramesFromSheet(
   }
   const frames = (width / cellSize) * (height / cellSize);
   return frames > 0 ? { frames, width, height } : { width, height };
+}
+
+/**
+ * Complete a persisted RescueMarker into the full descriptor by measuring the
+ * sheet that actually arrived. Shared by the fresh-fallback path and the
+ * resume-poll path (guard 0c) so a redelivered rescue is described exactly
+ * like a first-delivery one — the whole point of persisting the marker.
+ */
+function buildRescueInfo(
+  marker: RescueMarker,
+  base64: string,
+  taskId: string,
+  requestedFrames: number | undefined,
+  log: Logger
+): RescueInfo {
+  const sheet = deliveredFramesFromSheet(base64, marker.deliveredCellSize);
+
+  if (sheet.frames === undefined) {
+    log('warn', 'rescue delivered but frame count unreadable; deliveredFrames omitted', {
+      taskId,
+      sheetWidth: sheet.width,
+      sheetHeight: sheet.height,
+      cellSize: marker.deliveredCellSize,
+      reason: sheet.width === undefined
+        ? 'PNG header unreadable'
+        : 'sheet not an exact multiple of cell size',
+    });
+  } else {
+    log('info', 'rescue delivered', {
+      taskId,
+      requestedWidth: marker.requestedWidth,
+      requestedHeight: marker.requestedHeight,
+      sheetWidth: sheet.width,
+      sheetHeight: sheet.height,
+      deliveredCellSize: marker.deliveredCellSize,
+      deliveredFrames: sheet.frames,
+      requestedFrames,
+    });
+  }
+
+  return {
+    rescued: true,
+    ...marker,
+    ...(sheet.frames !== undefined ? { deliveredFrames: sheet.frames } : {}),
+  };
 }
 
 /**
@@ -317,6 +368,8 @@ async function handleMessage(
       taskId: state.taskId,
       originalStartedAt: state.startedAt,
       originalSubmitAttemptedAt: state.submitAttemptedAt,
+      // Present iff the task being resumed is a fallback's — see below.
+      resumingRescue: state.rescue !== undefined,
     });
     try {
       const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, state.taskId);
@@ -325,7 +378,20 @@ async function handleMessage(
         balance_cost: result.balance_cost,
         remaining_balance: result.remaining_balance,
       });
-      await recordSuccess(env, msg, state.startedAt, result, log);
+      // A resumed FALLBACK task is still a rescue: the marker persisted at
+      // submit time tells us so, and this invocation now has the sheet, so
+      // it can finish the descriptor. Without the marker (a resumed PRIMARY
+      // task) this stays undefined and recordSuccess behaves as before.
+      const rescue = state.rescue
+        ? buildRescueInfo(
+            state.rescue,
+            result.base64_images[0],
+            state.taskId,
+            (msg.body.body as RdAnimateBody).frames_duration,
+            log
+          )
+        : undefined;
+      await recordSuccess(env, msg, state.startedAt, result, log, rescue);
     } catch (err) {
       if (isPollBudgetExceeded(err) && attempt < MAX_ATTEMPTS) {
         log('warn', 'resume-poll budget exhausted; task still live; redelivering to re-poll same taskId', {
@@ -639,46 +705,37 @@ async function runAnimateAsync(
   // Overwrite primary's taskId — one taskId in the running state at a time.
   // On redelivery, we resume THIS task (the last one attempted).
   // Same terminal-guard as the primary persist (fix 2).
-  const withFallbackTaskId: JobStateRunning = { ...runningState, taskId: fallbackTaskId };
+  //
+  // The rescue marker rides along in this SAME put (no extra KV op): from
+  // here on, the persisted state says this taskId is a fallback's, so a
+  // redelivery that resumes it (guard 0c) still knows to mark the delivery
+  // as a rescue. Without this the marker would live only in this function's
+  // scope and die with the invocation.
+  const rescueMarker: RescueMarker = {
+    requestedWidth,
+    requestedHeight,
+    deliveredCellSize: FALLBACK_CELL_SIZE,
+  };
+  const withFallbackTaskId: JobStateRunning = {
+    ...runningState,
+    taskId: fallbackTaskId,
+    rescue: rescueMarker,
+  };
   await writeStateUnlessTerminal(env, stateKey, withFallbackTaskId, log);
 
   const fallbackResult = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackTaskId);
 
-  // The fallback delivered — describe the rescue for the client. Geometry is
-  // read from what actually came back rather than from what we asked for:
-  // the request said 64×64 with frames_duration, but the sheet's real layout
-  // is the only thing that slices correctly.
-  const sheet = deliveredFramesFromSheet(fallbackResult.base64_images[0], FALLBACK_CELL_SIZE);
-  const rescue: RescueInfo = {
-    rescued: true,
-    requestedWidth,
-    requestedHeight,
-    deliveredCellSize: FALLBACK_CELL_SIZE,
-    ...(sheet.frames !== undefined ? { deliveredFrames: sheet.frames } : {}),
-  };
-
-  if (sheet.frames === undefined) {
-    log('warn', 'rescue delivered but frame count unreadable; deliveredFrames omitted', {
-      taskId: fallbackTaskId,
-      sheetWidth: sheet.width,
-      sheetHeight: sheet.height,
-      cellSize: FALLBACK_CELL_SIZE,
-      reason: sheet.width === undefined
-        ? 'PNG header unreadable'
-        : 'sheet not an exact multiple of cell size',
-    });
-  } else {
-    log('info', 'rescue delivered', {
-      taskId: fallbackTaskId,
-      requestedWidth,
-      requestedHeight,
-      sheetWidth: sheet.width,
-      sheetHeight: sheet.height,
-      deliveredCellSize: FALLBACK_CELL_SIZE,
-      deliveredFrames: sheet.frames,
-      requestedFrames: body.frames_duration,
-    });
-  }
+  // The fallback delivered — describe the rescue for the client. Frame count
+  // is measured from what actually came back rather than from what we asked
+  // for: the request said 64×64 with frames_duration, but the sheet's real
+  // layout is the only thing that slices correctly.
+  const rescue = buildRescueInfo(
+    rescueMarker,
+    fallbackResult.base64_images[0],
+    fallbackTaskId,
+    body.frames_duration,
+    log
+  );
 
   return { result: fallbackResult, rescue };
 }

@@ -68,6 +68,24 @@ export interface JobStateRunning {
    * status, resume polling this exact task; do not resubmit.
    */
   taskId?: string;
+  /**
+   * RESCUE MARKER (July 16). Present iff `taskId` refers to a FALLBACK task
+   * rather than a primary one. Written in the same put as the fallback's
+   * taskId, because the fact that we're rescuing is only known in
+   * runAnimateAsync's local scope — if the invocation dies mid-poll, a
+   * redelivery resuming this task would otherwise deliver a silently
+   * downgraded 64px sheet with no notice, which is exactly what marking
+   * rescues is meant to prevent.
+   *
+   * deliveredFrames is deliberately NOT here: it depends on the sheet that
+   * hasn't arrived yet, and is computed at success time on whichever
+   * invocation actually receives it.
+   */
+  rescue?: {
+    requestedWidth: number;
+    requestedHeight: number;
+    deliveredCellSize: number;
+  };
 }
 
 export interface JobStateSuccess {
