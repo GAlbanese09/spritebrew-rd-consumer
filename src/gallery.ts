@@ -71,6 +71,10 @@ export interface GalleryWriteParams {
   mode: JobMode;
   /** ms epoch, the stable timestamp used for invTs. */
   createdAt: number;
+  /** Animate-only. `true` iff the fallback produced this sheet; omitted from
+   *  the row entirely otherwise, so normal rows are unchanged. Costs ~16
+   *  bytes of the 1024-byte metadata budget. */
+  rescued?: true;
 }
 
 export type Logger = (
@@ -84,7 +88,7 @@ export async function writeGalleryEntry(
   params: GalleryWriteParams,
   log: Logger
 ): Promise<void> {
-  const { jobId, userId, pngBytes, prompt, style, mode, createdAt } = params;
+  const { jobId, userId, pngBytes, prompt, style, mode, createdAt, rescued } = params;
 
   const r2Key = galleryR2Key(userId, jobId);
   const kvKey = galleryKvKey(userId, createdAt, jobId);
@@ -98,6 +102,7 @@ export async function writeGalleryEntry(
     mode,
     ...(action !== undefined ? { action } : {}),
     createdAt,
+    ...(rescued ? { rescued: true as const } : {}),
     v: 1,
   };
 

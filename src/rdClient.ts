@@ -155,10 +155,32 @@ interface RdTaskPollResponse {
     model?: string;
     remaining_credits?: number;
     remaining_balance?: number;
-    error?: string;
+    /** Typed `unknown`, not `string`: the failure shape was never observed on
+     *  file, and in practice RD sends an object here often enough that the
+     *  old `string` annotation was a lie that template-interpolated to
+     *  "[object Object]" in ops logs. See errorText() below. */
+    error?: unknown;
   } | null;
-  error?: string;
-  message?: string;
+  error?: unknown;
+  message?: unknown;
+}
+
+/**
+ * Coerce a defensively-extracted error value to readable text. RD's failure
+ * payloads are not on file, so `error`/`message` may be an object; a bare
+ * template interpolation turns those into "[object Object]" and the real
+ * cause is lost for good (this is the whole log fix). Strings pass through
+ * untouched so today's messages are unchanged.
+ */
+function errorText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch {
+    // Circular / non-serializable — fall through to String().
+  }
+  return String(value);
 }
 
 const TERMINAL_SUCCESS = /^succeeded$/i;
@@ -205,7 +227,7 @@ export async function submitAsyncTask(
     // whose id we lost. Caller's submitAttemptedAt guard handles this.
     const elapsedMs = Date.now() - startedAt;
     const name = err instanceof Error ? err.name : 'Error';
-    const message = err instanceof Error ? err.message : String(err);
+    const message = err instanceof Error ? err.message : errorText(err);
     throw new RdError(
       `RD async submit threw after ${elapsedMs}ms: ${name}: ${message}`,
       0,
@@ -352,12 +374,14 @@ export async function pollAsyncTask(
     }
 
     if (TERMINAL_FAILURE.test(status)) {
-      // Defensive error extraction: shape wasn't observed on file.
-      const errMsg =
+      // Defensive error extraction: shape wasn't observed on file. Non-string
+      // values are JSON-stringified rather than interpolated blindly.
+      const errMsg = errorText(
         record.result?.error ??
-        record.error ??
-        record.message ??
-        `rd_task_${status}`;
+          record.error ??
+          record.message ??
+          `rd_task_${status}`
+      );
       throw new RdError(
         `RD async task ${status} for task ${taskId}: ${errMsg}`,
         resp.status,

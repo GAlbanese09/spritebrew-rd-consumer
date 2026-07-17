@@ -29,6 +29,9 @@
 //        animation__any_animation clamped to 64×64 (probe C5). If fallback
 //        input isn't available and original >64px, skip fallback and let
 //        the primary error propagate.
+//        A fallback delivery is MARKED (July 16): the success record carries
+//        rescued + requested/delivered geometry so the client can say so
+//        outright instead of inferring it. WHEN a rescue happens is unchanged.
 //   4a. SUCCESS         → gallery + KV success + ack.
 //   4b. RETRYABLE FAIL  → msg.retry(), no refund yet.
 //   4c. TERMINAL FAIL   → refund + KV error + ack.
@@ -69,12 +72,113 @@ const JOB_TTL_S = 60 * 60;           // 1h — long enough that a refresh recove
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
 const STATUS_RETRY_DELAY_S = 60;     // pre-flight backoff between attempts
+const FALLBACK_CELL_SIZE = 64;       // animation__any_animation is 64×64-locked (probe C5)
 
 type Logger = (
   level: 'info' | 'warn' | 'error',
   message: string,
   extra?: Record<string, unknown>
 ) => void;
+
+/**
+ * Readable text for an arbitrary thrown value. `String(err)` on a plain
+ * object yields "[object Object]", which is how a primary RD failure could
+ * reach the logs with its cause erased. Errors and strings behave exactly as
+ * before; only the non-string, non-Error case changes.
+ */
+function errText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  try {
+    const json = JSON.stringify(err);
+    if (json !== undefined) return json;
+  } catch {
+    // Circular / non-serializable — fall through to String().
+  }
+  return String(err);
+}
+
+/**
+ * Rescue descriptor for a delivery that came from the animate fallback.
+ * Built at the fallback's success site (the only place that knows both what
+ * was asked for and what came back) and threaded into recordSuccess, which
+ * writes it onto the success record. The client reads `rescued` explicitly
+ * rather than inferring a rescue from geometry.
+ */
+interface RescueInfo {
+  rescued: true;
+  requestedWidth: number;
+  requestedHeight: number;
+  deliveredCellSize: number;
+  deliveredFrames?: number;
+}
+
+/** What runAnimateAsync hands back: the RD result plus, iff the fallback
+ *  served it, the rescue descriptor. */
+interface AnimateOutcome {
+  result: RdSuccessResponse;
+  rescue?: RescueInfo;
+}
+
+// ─── PNG header parsing (delivered-geometry read) ──────────────────────────
+
+// A PNG's IHDR is fixed-offset: 8-byte signature, then the first chunk's
+// 4-byte length, the 4-byte type tag "IHDR", then width and height as
+// big-endian uint32s at byte offsets 16 and 20. 24 bytes total, which is
+// exactly the first 32 base64 characters — so we decode only that prefix
+// rather than the whole multi-hundred-KB sheet.
+//
+// Scope note (July 7 lesson): that lesson was about the COLOR-TYPE byte,
+// where RD's declared value disagreed with the actual pixel data. It says
+// nothing about dimensions, which are structural — a decoder that misread
+// them could not produce a displayable image at all. Dimensions are safe to
+// trust here; color type still is not.
+const PNG_HEADER_B64_CHARS = 32;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function readPngDimensions(base64: string): { width: number; height: number } | null {
+  let bytes: Uint8Array;
+  try {
+    if (base64.length < PNG_HEADER_B64_CHARS) return null;
+    bytes = base64ToBytes(base64.slice(0, PNG_HEADER_B64_CHARS));
+  } catch {
+    return null;  // Not decodable base64 — caller treats geometry as unknown.
+  }
+  if (bytes.length < 24) return null;
+  for (let i = 0; i < PNG_SIGNATURE.length; i++) {
+    if (bytes[i] !== PNG_SIGNATURE[i]) return null;
+  }
+  // IHDR is required by spec to be the first chunk; if it isn't, this isn't a
+  // shape we understand and we decline rather than guess.
+  const chunkType = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+  if (chunkType !== 'IHDR') return null;
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  if (width === 0 || height === 0) return null;
+  return { width, height };
+}
+
+/**
+ * Frames in a delivered spritesheet: (W/cell)*(H/cell). Returns undefined
+ * when the header is unreadable or the sheet isn't an exact multiple of the
+ * cell — a wrong frame count would slice the animation visibly wrong, so an
+ * absent field (client falls back to its own guess) beats a confident lie.
+ */
+function deliveredFramesFromSheet(
+  base64: string,
+  cellSize: number
+): { frames?: number; width?: number; height?: number } {
+  const dims = readPngDimensions(base64);
+  if (!dims) return {};
+  const { width, height } = dims;
+  if (width % cellSize !== 0 || height % cellSize !== 0) {
+    return { width, height };
+  }
+  const frames = (width / cellSize) * (height / cellSize);
+  return frames > 0 ? { frames, width, height } : { width, height };
+}
 
 /**
  * True for the poll-budget-exhaustion RdError specifically (status 0, message
@@ -173,12 +277,16 @@ async function handleMessage(
           style: body.prompt_style,
           mode,
           createdAt: state.completedAt,
+          // Carry the marker forward from the recorded success — a self-heal
+          // must rewrite the same row, not a row that has forgotten it was
+          // a rescue.
+          ...(state.rescued ? { rescued: true as const } : {}),
         },
         log
       );
     } catch (galleryErr) {
       log('error', 'self-healing gallery write failed; retrying message', {
-        error: galleryErr instanceof Error ? galleryErr.message : String(galleryErr),
+        error: errText(galleryErr),
       });
       msg.retry();
       return;
@@ -314,7 +422,7 @@ async function handleMessage(
 
   // === 3. Call RD.
   try {
-    const result: RdSuccessResponse =
+    const outcome: AnimateOutcome =
       mode === 'animate'
         ? await runAnimateAsync(
             env,
@@ -324,21 +432,24 @@ async function handleMessage(
             fallbackInputImage,
             log
           )
-        : await callRd(env.RETRO_DIFFUSION_API_KEY, 'create', body);
+        : { result: await callRd(env.RETRO_DIFFUSION_API_KEY, 'create', body) };
+
+    const { result, rescue } = outcome;
 
     log('info', 'rd success', {
       rdLatencyMs: Date.now() - startedAt,
       rdBalanceCost: result.balance_cost,
       rdRemainingBalance: result.remaining_balance,
+      rescued: rescue !== undefined,
     });
 
-    await recordSuccess(env, msg, startedAt, result, log);
+    await recordSuccess(env, msg, startedAt, result, log, rescue);
     return;
   } catch (err) {
     const errorCode = classifyError(err);
     const isRdError = err instanceof RdError;
     const retryable = isRdError ? err.retryable : true;
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = errText(err);
 
     // Fix 1: poll-budget exhaustion on the FRESH run's primary poll.
     // runAnimateAsync must NOT fallback (see comment there); the task is
@@ -388,6 +499,10 @@ async function handleMessage(
  * fallback on failure. Persists the task_id to KV immediately after each
  * submit so redelivery can resume polling instead of resubmitting (billing
  * safety per receipt 6: no task-list recovery endpoint).
+ *
+ * Returns the RD result plus, when the fallback served it, a RescueInfo the
+ * caller records on the success state. WHEN a rescue happens is unchanged by
+ * the July-16 work — only whether we describe it afterwards.
  */
 async function runAnimateAsync(
   env: Env,
@@ -396,32 +511,59 @@ async function runAnimateAsync(
   body: RdAnimateBody,
   fallbackInputImage: string | undefined,
   log: Logger
-): Promise<RdSuccessResponse> {
+): Promise<AnimateOutcome> {
+  // Requested geometry, captured before any clamp. `body` is never mutated
+  // (the fallback builds a copy), but reading these up front keeps the
+  // rescue descriptor honest even if that ever changes.
+  const requestedWidth = body.width;
+  const requestedHeight = body.height;
+
+  // Dev-only: skip the primary entirely and synthesize its failure, so the
+  // rescue path can be exercised on demand. The fallback's own eligibility
+  // gates below are NOT bypassed — forcing a rescue on a job that could
+  // never rescue in production would be a test that proves nothing.
+  const forceFallback = env.FORCE_ANIMATE_FALLBACK === 'true';
+
   // Primary attempt.
   let primaryErr: unknown;
-  try {
-    const { taskId, submitElapsedMs } = await submitAsyncTask(
-      env.RETRO_DIFFUSION_API_KEY,
-      body
-    );
-    log('info', 'primary async submit accepted', {
-      taskId,
-      submitElapsedMs,
+  if (forceFallback) {
+    log('warn', 'FORCE_ANIMATE_FALLBACK active - dev testing only', {
       promptStyle: body.prompt_style,
-      width: body.width,
-      height: body.height,
+      requestedWidth,
+      requestedHeight,
+      effect: 'primary submit skipped; going straight to fallback',
     });
+    primaryErr = new RdError(
+      'FORCE_ANIMATE_FALLBACK: primary submit skipped (dev testing only)',
+      0,
+      false,
+      ''
+    );
+  } else {
+    try {
+      const { taskId, submitElapsedMs } = await submitAsyncTask(
+        env.RETRO_DIFFUSION_API_KEY,
+        body
+      );
+      log('info', 'primary async submit accepted', {
+        taskId,
+        submitElapsedMs,
+        promptStyle: body.prompt_style,
+        width: body.width,
+        height: body.height,
+      });
 
-    // Persist task_id BEFORE polling so a poll-time crash resumes correctly.
-    // Routed through writeStateUnlessTerminal (fix 2): a concurrent
-    // redelivery may have already committed a terminal state; we must not
-    // overwrite it here with a stale 'running' record.
-    const withTaskId: JobStateRunning = { ...runningState, taskId };
-    await writeStateUnlessTerminal(env, stateKey, withTaskId, log);
+      // Persist task_id BEFORE polling so a poll-time crash resumes correctly.
+      // Routed through writeStateUnlessTerminal (fix 2): a concurrent
+      // redelivery may have already committed a terminal state; we must not
+      // overwrite it here with a stale 'running' record.
+      const withTaskId: JobStateRunning = { ...runningState, taskId };
+      await writeStateUnlessTerminal(env, stateKey, withTaskId, log);
 
-    return await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, taskId);
-  } catch (err) {
-    primaryErr = err;
+      return { result: await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, taskId) };
+    } catch (err) {
+      primaryErr = err;
+    }
   }
 
   // Fix 1: poll-budget exhaustion is NOT a fallback trigger. The RD task
@@ -453,15 +595,15 @@ async function runAnimateAsync(
   //   - input_image: envelope's fallbackInputImage if present; otherwise
   //     reuse body.input_image only when the original request was already
   //     64px. Oversized reuse = deterministic 400, so we skip fallback.
-  const originalSize = body.width;
   const hasEnvelopeInput = typeof fallbackInputImage === 'string' && fallbackInputImage.length > 0;
-  const canUseOriginalInput = originalSize <= 64 && body.height <= 64;
+  const canUseOriginalInput =
+    requestedWidth <= FALLBACK_CELL_SIZE && requestedHeight <= FALLBACK_CELL_SIZE;
 
   if (!hasEnvelopeInput && !canUseOriginalInput) {
     log('warn', 'fallback unavailable: no 64px input in envelope; primary failure will propagate', {
-      originalWidth: body.width,
-      originalHeight: body.height,
-      primaryError: primaryErr.message,
+      originalWidth: requestedWidth,
+      originalHeight: requestedHeight,
+      primaryError: errText(primaryErr),
     });
     throw primaryErr;
   }
@@ -469,17 +611,19 @@ async function runAnimateAsync(
   const fallbackBody: RdAnimateBody = {
     ...body,
     prompt_style: 'animation__any_animation',
-    width: 64,
-    height: 64,
+    width: FALLBACK_CELL_SIZE,
+    height: FALLBACK_CELL_SIZE,
     input_image: hasEnvelopeInput ? fallbackInputImage : body.input_image,
     // frames_duration and remove_bg carried via spread — no delete.
   };
 
   log('info', 'attempting fallback', {
-    reason: 'primary rd_advanced_animation__ failed',
+    reason: forceFallback
+      ? 'FORCE_ANIMATE_FALLBACK (dev testing only)'
+      : 'primary rd_advanced_animation__ failed',
     primaryStatus: primaryErr.status,
-    primaryMessage: primaryErr.message,
-    fallbackShape: '64x64',
+    primaryMessage: errText(primaryErr),
+    fallbackShape: `${FALLBACK_CELL_SIZE}x${FALLBACK_CELL_SIZE}`,
     usedEnvelopeInput: hasEnvelopeInput,
     fallbackKeepsRemoveBg: body.remove_bg === true,
   });
@@ -498,7 +642,45 @@ async function runAnimateAsync(
   const withFallbackTaskId: JobStateRunning = { ...runningState, taskId: fallbackTaskId };
   await writeStateUnlessTerminal(env, stateKey, withFallbackTaskId, log);
 
-  return await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackTaskId);
+  const fallbackResult = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackTaskId);
+
+  // The fallback delivered — describe the rescue for the client. Geometry is
+  // read from what actually came back rather than from what we asked for:
+  // the request said 64×64 with frames_duration, but the sheet's real layout
+  // is the only thing that slices correctly.
+  const sheet = deliveredFramesFromSheet(fallbackResult.base64_images[0], FALLBACK_CELL_SIZE);
+  const rescue: RescueInfo = {
+    rescued: true,
+    requestedWidth,
+    requestedHeight,
+    deliveredCellSize: FALLBACK_CELL_SIZE,
+    ...(sheet.frames !== undefined ? { deliveredFrames: sheet.frames } : {}),
+  };
+
+  if (sheet.frames === undefined) {
+    log('warn', 'rescue delivered but frame count unreadable; deliveredFrames omitted', {
+      taskId: fallbackTaskId,
+      sheetWidth: sheet.width,
+      sheetHeight: sheet.height,
+      cellSize: FALLBACK_CELL_SIZE,
+      reason: sheet.width === undefined
+        ? 'PNG header unreadable'
+        : 'sheet not an exact multiple of cell size',
+    });
+  } else {
+    log('info', 'rescue delivered', {
+      taskId: fallbackTaskId,
+      requestedWidth,
+      requestedHeight,
+      sheetWidth: sheet.width,
+      sheetHeight: sheet.height,
+      deliveredCellSize: FALLBACK_CELL_SIZE,
+      deliveredFrames: sheet.frames,
+      requestedFrames: body.frames_duration,
+    });
+  }
+
+  return { result: fallbackResult, rescue };
 }
 
 // ─── Success / failure recorders (shared by fresh and resume paths) ────────
@@ -508,7 +690,10 @@ async function recordSuccess(
   msg: Message<JobMessage>,
   startedAt: number,
   result: RdSuccessResponse,
-  log: Logger
+  log: Logger,
+  /** Present iff the animate fallback produced this result. Absent on every
+   *  normal success, which keeps those records byte-identical to today's. */
+  rescue?: RescueInfo
 ): Promise<void> {
   const { jobId, userId, mode, body } = msg.body;
   const stateKey = `job:${jobId}`;
@@ -556,12 +741,13 @@ async function recordSuccess(
         style: body.prompt_style,
         mode,
         createdAt: completedAt,
+        ...(rescue ? { rescued: true as const } : {}),
       },
       log
     );
   } catch (galleryErr) {
     log('error', 'gallery write failed; retrying message', {
-      error: galleryErr instanceof Error ? galleryErr.message : String(galleryErr),
+      error: errText(galleryErr),
     });
     msg.retry();
     return;
@@ -576,6 +762,9 @@ async function recordSuccess(
     completedAt,
     resultBase64: result.base64_images[0],
     rdBalanceCost: result.balance_cost,
+    // Spread, not per-field assignment: on a normal success `rescue` is
+    // undefined and NOTHING is added, so the serialized record is unchanged.
+    ...(rescue ?? {}),
   };
   // writeStateUnlessTerminal covers the very-narrow race where a
   // concurrent invocation transitioned to terminal between the pre-check
@@ -597,7 +786,7 @@ async function recordFailure(
 ): Promise<void> {
   const { jobId, userId, mode, tokenCost } = msg.body;
   const stateKey = `job:${jobId}`;
-  const errMsg = err instanceof Error ? err.message : String(err);
+  const errMsg = errText(err);
   const attempt = msg.attempts ?? 1;
 
   try {
@@ -632,7 +821,7 @@ async function recordFailure(
 
     msg.ack();
   } catch (refundErr) {
-    const refundErrMsg = refundErr instanceof Error ? refundErr.message : String(refundErr);
+    const refundErrMsg = errText(refundErr);
     log('error', 'refund failed; retrying message', { refundErrMsg });
     // If the refund itself fails (e.g., transient KV blip), retry the whole
     // message. Idempotency on token_idempotency:refund:{jobId} ensures no

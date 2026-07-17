@@ -79,6 +79,32 @@ export interface JobStateSuccess {
   completedAt: number;
   resultBase64: string;
   rdBalanceCost?: number;
+  /**
+   * RESCUE MARKER (July 16). Present ONLY when the delivered sheet came from
+   * the animate fallback (animation__any_animation, 64×64-clamped) after the
+   * primary rd_advanced_animation__* attempt failed. The client must not infer
+   * a rescue from geometry — a 64px request that succeeds normally delivers
+   * the same geometry as a 64px rescue. `rescued` is the only signal.
+   *
+   * All five fields are absent on a normal success, so those records stay
+   * byte-identical to pre-July-16 ones.
+   */
+  rescued?: true;
+  /** Width the user actually asked for, pre-clamp (e.g. 128, 256). */
+  requestedWidth?: number;
+  /** Height the user actually asked for, pre-clamp. */
+  requestedHeight?: number;
+  /** Cell size actually delivered. Always 64 today — the fallback style is
+   *  64×64-locked (probe C5). Recorded rather than assumed so the client
+   *  doesn't hardcode it. */
+  deliveredCellSize?: number;
+  /**
+   * Frame count actually delivered, derived from the PNG's IHDR dimensions:
+   * (W/cell)*(H/cell). Absent when the header couldn't be read or the sheet
+   * isn't an exact multiple of the cell size — the rescue is still real and
+   * still marked, the client just falls back to its own slicing guess.
+   */
+  deliveredFrames?: number;
 }
 
 export interface JobStateError {
@@ -104,6 +130,15 @@ export interface Env {
   SPRITEBREW_KV: KVNamespace;
   GALLERY_BUCKET: R2Bucket;
   RETRO_DIFFUSION_API_KEY: string;
+  /**
+   * DEV TESTING ONLY. When exactly 'true', animate jobs skip the primary
+   * submit and go straight to the fallback, so the rescue path can be
+   * exercised without waiting for a real provider failure. Set manually on
+   * the dev worker via the dashboard and REMOVED after testing — deliberately
+   * absent from wrangler.toml so it can never ride a deploy to prod. Any
+   * other value (including unset) leaves the code inert.
+   */
+  FORCE_ANIMATE_FALLBACK?: string;
 }
 
 /**
@@ -120,7 +155,8 @@ export interface Env {
  * either side, update both files in the same PR and bump the "Last schema
  * review" date below.
  *
- * Last schema review: 2026-05-20 (Day-9, Phase 2)
+ * Last schema review: 2026-07-16 (rescue marker added; v stays 1 — the field
+ * is optional and additive, so existing readers are unaffected)
  */
 export interface GalleryEntryV1 {
   jobId: string;
@@ -129,5 +165,6 @@ export interface GalleryEntryV1 {
   mode: JobMode;               // 'create' | 'animate'
   action?: string;             // animate-only; suffix of prompt_style
   createdAt: number;           // ms epoch; sourced from completedAt
+  rescued?: true;              // animate-only; present iff delivered by the fallback
   v: 1;                        // schema version
 }
