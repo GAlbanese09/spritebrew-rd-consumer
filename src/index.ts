@@ -284,6 +284,16 @@ export default {
       await handleMessage(msg, env);
     }
   },
+  // Cron: every 15 min (see wrangler.toml). Reconciles records the queue path
+  // left stuck 'running' — the create isolate-kill orphan class — by refunding
+  // and terminal-failing them out of band. Idempotent and terminal-safe.
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    _ctx: ExecutionContext
+  ): Promise<void> {
+    await sweepStaleRunning(env);
+  },
 } satisfies ExportedHandler<Env, JobMessage>;
 
 async function handleMessage(
@@ -436,19 +446,44 @@ async function handleMessage(
     return;
   }
 
-  // === 0e. Legacy running (no async fields) within timeout → treat as
-  //     concurrent duplicate. Backwards-compat: old pre-July-15 running
-  //     records lack the new markers and land here.
+  // === 0e. Running with no async markers, still inside the running window.
+  //     This is either (a) a genuinely concurrent duplicate delivery — a live
+  //     sibling invocation is mid-run — or (b) a redelivery whose previous
+  //     invocation DIED before writing any terminal state (the create-path
+  //     isolate-kill orphan). We tell them apart by msg.attempts:
+  //
+  //       attempt === 1 → first delivery of THIS message; a running record we
+  //         didn't write means a sibling is live → ack as a true duplicate.
+  //       attempt  >  1 → THIS message was already delivered and failed to
+  //         terminate; its prior invocation is the one that wrote this record
+  //         and then died. Acking here is exactly the bug: it consumes the
+  //         message with no refund and no terminal state, and the record then
+  //         expires at its 1h TTL. Defer instead so it re-enters after the
+  //         window ages out, where the fall-through path reclaims it (fresh
+  //         run) or a terminal write happens. The stale-running sweep (cron)
+  //         is the backstop that guarantees a refund even if this DLQs first.
+  //
+  //     (msg.attempts starts at 1 on the first delivery, so attempt > 1 is
+  //     strictly a redelivery.)
   if (
     state?.status === 'running' &&
     !state.taskId &&
     !state.submitAttemptedAt &&
     Date.now() - state.startedAt < RUNNING_TIMEOUT_MS
   ) {
-    log('warn', 'another invocation is running this job; acking duplicate', {
+    if (attempt === 1) {
+      log('warn', 'another invocation is running this job; acking duplicate', {
+        startedAt: state.startedAt,
+      });
+      msg.ack();
+      return;
+    }
+    log('warn', 'legacy-running on redelivery - deferring instead of acking', {
       startedAt: state.startedAt,
+      attempt,
+      ageMs: Date.now() - state.startedAt,
     });
-    msg.ack();
+    msg.retry({ delaySeconds: 30 });
     return;
   }
 
@@ -478,6 +513,8 @@ async function handleMessage(
     enqueuedAt: msg.body.enqueuedAt,
     startedAt,
     attempt,
+    // Persisted so the stale-running cron sweep can refund without the message.
+    tokenCost,
   };
   if (mode === 'animate') {
     runningState.submitAttemptedAt = startedAt;
@@ -902,6 +939,12 @@ function classifyError(err: unknown): string {
     if (err.status === 0 && err.message.startsWith('RD async poll exceeded budget')) {
       return 'rd_async_timeout';
     }
+    // Sync create-path timeout (fix 1). Status 0 like the async-0 cases, so it
+    // must be matched by message prefix before the rd_${status} fallback would
+    // emit a bare 'rd_0'.
+    if (err.status === 0 && err.message.startsWith('RD sync call timed out')) {
+      return 'rd_sync_timeout';
+    }
     // Fix 3: pollAsyncTask throws these two with resp.status=200, so the
     // default `rd_${err.status}` fallback would emit the misleading
     // 'rd_200' — a "successful HTTP but broken payload" is not the same
@@ -915,6 +958,141 @@ function classifyError(err: unknown): string {
     return `rd_${err.status}`;
   }
   return 'consumer_unknown';
+}
+
+// ─── Stale-running sweep (cron reconciler) ─────────────────────────────────
+
+const SWEEP_KEY_PREFIX = 'job:';
+const SWEEP_STALE_AFTER_MS = 20 * 60 * 1000;  // 20 min — well past any legitimate run
+const SWEEP_MAX_PER_RUN = 200;                // cap refunds/run so the cron stays short
+const SWEEP_MAX_PAGES = 10;                   // cap list pages examined/run (≤10k keys)
+
+/**
+ * Reconcile records the queue path left stuck 'running'. The create isolate-
+ * kill orphan (§investigation) never reaches recordFailure, so nothing refunds
+ * it and it silently expires at the 1h TTL. This sweep is the backstop: any
+ * 'running' record older than SWEEP_STALE_AFTER_MS is terminal-failed through
+ * the SAME refund helper a caught error uses.
+ *
+ * Safety:
+ *   - refundTokens is idempotent on token_idempotency:refund:{jobId}, so a
+ *     record the queue path is ALSO about to refund can't be double-refunded.
+ *   - the error state is written via writeStateUnlessTerminal, so a success or
+ *     error a concurrent invocation just committed is never clobbered.
+ *   - only 'running' records are touched; terminal records are skipped.
+ *
+ * Listing: the Worker runtime KV list API (env.SPRITEBREW_KV.list), NOT the
+ * wrangler CLI — CLI prefix listing is unreliable on Windows PowerShell, but
+ * the runtime API is fine. Prefix 'job:'. We page with the returned cursor,
+ * bounded by SWEEP_MAX_PAGES and SWEEP_MAX_PER_RUN so a run can't grow long.
+ */
+async function sweepStaleRunning(env: Env): Promise<void> {
+  const now = Date.now();
+  const log: Logger = (level, message, extra = {}) =>
+    console[level](JSON.stringify({ level, message, source: 'stale-running-sweep', ...extra }));
+
+  log('info', 'sweep started', {
+    staleAfterMs: SWEEP_STALE_AFTER_MS,
+    maxPerRun: SWEEP_MAX_PER_RUN,
+  });
+
+  let processed = 0;
+  let examined = 0;
+  let cursor: string | undefined;
+
+  for (let page = 0; page < SWEEP_MAX_PAGES; page++) {
+    const listing = await env.SPRITEBREW_KV.list({ prefix: SWEEP_KEY_PREFIX, cursor });
+
+    for (const key of listing.keys) {
+      if (processed >= SWEEP_MAX_PER_RUN) break;
+      examined++;
+
+      const raw = await env.SPRITEBREW_KV.get(key.name);
+      if (!raw) continue;  // expired between list and get
+
+      let st: JobState;
+      try {
+        st = JSON.parse(raw) as JobState;
+      } catch {
+        continue;  // unparseable — leave it; not ours to guess at
+      }
+
+      if (st.status !== 'running') continue;         // never touch terminal/pending
+      const ageMs = now - st.startedAt;
+      if (ageMs <= SWEEP_STALE_AFTER_MS) continue;    // still plausibly in flight
+
+      const jobId = key.name.slice(SWEEP_KEY_PREFIX.length);
+      await sweepOne(env, jobId, st, ageMs, log);
+      processed++;
+    }
+
+    if (listing.list_complete || processed >= SWEEP_MAX_PER_RUN) break;
+    cursor = listing.cursor;
+  }
+
+  log('info', 'sweep complete', { processed, examined });
+}
+
+/**
+ * Terminal-fail one stale 'running' record: refund (idempotent) then write the
+ * error state (terminal-guarded). A failure here is logged and left for the
+ * next run rather than throwing — one bad record must not abort the batch.
+ */
+async function sweepOne(
+  env: Env,
+  jobId: string,
+  state: JobStateRunning,
+  ageMs: number,
+  log: Logger
+): Promise<void> {
+  const { userId, mode, tokenCost } = state;
+
+  // Records written before tokenCost was persisted can't be refunded a correct
+  // amount from state alone. They expire at the 1h TTL; skip with a loud note.
+  if (typeof tokenCost !== 'number') {
+    log('warn', 'stale running record has no tokenCost; cannot refund (legacy pre-sweep record); skipping', {
+      jobId,
+      userId,
+      mode,
+      ageMs,
+    });
+    return;
+  }
+
+  const stateKey = `${SWEEP_KEY_PREFIX}${jobId}`;
+  try {
+    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId);
+
+    const errorState: JobStateError = {
+      status: 'error',
+      userId,
+      mode,
+      enqueuedAt: state.enqueuedAt,
+      failedAt: Date.now(),
+      error: `stale running record swept after ${Math.round(ageMs / 1000)}s`,
+      errorCode: 'stale_running_swept',
+      attempts: state.attempt,
+      refunded: !refundResult.alreadyApplied,
+    };
+    await writeStateUnlessTerminal(env, stateKey, errorState, log);
+
+    log('info', 'stale running record swept', {
+      jobId,
+      userId,
+      mode,
+      ageMs,
+      alreadyRefunded: refundResult.alreadyApplied,
+      newBalance: refundResult.newBalance,
+    });
+  } catch (err) {
+    log('error', 'stale-running sweep failed for record; leaving for next run', {
+      jobId,
+      userId,
+      mode,
+      ageMs,
+      error: errText(err),
+    });
+  }
 }
 
 // Silence tsc for unused imports that are here for type-only reference in

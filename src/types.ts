@@ -53,6 +53,15 @@ export interface JobStateRunning {
   startedAt: number;
   attempt: number;
   /**
+   * Tokens to refund if this job has to be terminal-failed. Copied from the
+   * queue message onto the running record so an OUT-OF-BAND reconciler (the
+   * stale-running cron sweep) can refund the correct amount without the
+   * message in hand — the message only exists inside a queue invocation.
+   * Optional: records written before this field existed parse without it, and
+   * the sweep skips any record lacking it (they expire at the 1h TTL anyway).
+   */
+  tokenCost?: number;
+  /**
    * Set immediately BEFORE the async submit fetch fires (animate/async path
    * only). Purpose is redelivery-safety billing: if a message is redelivered
    * and this marker is present but taskId is absent, the previous invocation

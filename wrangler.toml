@@ -21,6 +21,10 @@ max_batch_timeout = 0               # don't wait to batch
 max_retries = 3                     # try original + 3 retries before DLQ
 dead_letter_queue = "spritebrew-rd-jobs-dlq"
 
+# Cron: stale-running sweep (scheduled handler in src/index.ts). Every 15 min.
+[env.production.triggers]
+crons = ["*/15 * * * *"]
+
 [[env.production.kv_namespaces]]
 binding = "SPRITEBREW_KV"
 id = "ed99497beaaa432f88000689ab78821c"
@@ -42,6 +46,10 @@ max_batch_size = 1
 max_batch_timeout = 0
 max_retries = 3
 dead_letter_queue = "spritebrew-rd-jobs-dlq-dev"
+
+# Cron: stale-running sweep (scheduled handler in src/index.ts). Every 15 min.
+[env.preview.triggers]
+crons = ["*/15 * * * *"]
 
 [[env.preview.kv_namespaces]]
 binding = "SPRITEBREW_KV"

@@ -17,6 +17,15 @@ const RD_STATUS_URL = 'https://api.retrodiffusion.ai/v1/status';
 const HTTP_USER_AGENT = 'spritebrew-rd-consumer/0.1.0 (+https://spritebrew.com)';
 const HTTP_ACCEPT = 'application/json, */*';
 
+// Client-side ceiling on the sync create call. Until now callRd had NO timeout,
+// so a slow 256px generation could hang until the Queues consumer's wall-clock
+// limit killed the isolate BEFORE the handler's catch ran — leaving the job
+// stuck 'running' with no refund. 4 min is comfortably longer than a healthy
+// 256px create yet well short of the wall-clock limit, so the abort surfaces as
+// a catchable RdError instead of an isolate kill. The async path already bounds
+// every call this way (submit 600s, poll 30s, status 10s).
+const SYNC_CALL_TIMEOUT_MS = 240_000;
+
 export type RdMode = 'create' | 'animate';
 
 export interface RdCreateBody {
@@ -73,18 +82,40 @@ export async function callRd(
   _mode: RdMode,
   body: RdCreateBody | RdAnimateBody
 ): Promise<RdSuccessResponse> {
-  const resp = await fetch(RD_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-RD-Token': apiKey,
-      // Explicit UA + Accept: RD's CF edge 403s the default Worker UA.
-      // Diagnostic confirmed cf-ray + server:cloudflare on the 403 page.
-      'User-Agent': HTTP_USER_AGENT,
-      'Accept': HTTP_ACCEPT,
-    },
-    body: JSON.stringify(body),
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(RD_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-RD-Token': apiKey,
+        // Explicit UA + Accept: RD's CF edge 403s the default Worker UA.
+        // Diagnostic confirmed cf-ray + server:cloudflare on the 403 page.
+        'User-Agent': HTTP_USER_AGENT,
+        'Accept': HTTP_ACCEPT,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(SYNC_CALL_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // AbortSignal.timeout rejects with a TimeoutError. Treat ONLY that as our
+    // bounded timeout: status 0, NON-retryable (RD has no idempotency keys and
+    // the work may have completed and billed — a resubmit would double-bill).
+    // The caller maps this message prefix to errorCode 'rd_sync_timeout' and,
+    // being non-retryable, it flows straight to recordFailure → refund.
+    const name = err instanceof Error ? err.name : '';
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new RdError(
+        `RD sync call timed out after ${SYNC_CALL_TIMEOUT_MS}ms`,
+        0,
+        false,
+        ''
+      );
+    }
+    // Any other throw (network blip, DNS, etc.) keeps its prior semantics:
+    // rethrow so the handler's non-RdError branch treats it as retryable.
+    throw err;
+  }
 
   const text = await resp.text();
 
