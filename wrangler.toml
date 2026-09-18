@@ -33,6 +33,15 @@ id = "ed99497beaaa432f88000689ab78821c"
 binding = "GALLERY_BUCKET"
 bucket_name = "spritebrew-gallery"
 
+# Observability: enabled in the dashboard 2026-09-18 after the discovery that
+# every log('warn') the consumer writes about an RD failure or a rescue was
+# being discarded. Declared here so a deploy cannot silently switch it back
+# off, since wrangler deploys whatever this file says.
+[env.production.observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
 # RETRO_DIFFUSION_API_KEY set via:
 #   npx wrangler secret put RETRO_DIFFUSION_API_KEY --env production
 
@@ -58,3 +67,8 @@ id = "18dd9502fdde4a2ea76f9b9eb9cc5e8b"
 [[env.preview.r2_buckets]]
 binding = "GALLERY_BUCKET"
 bucket_name = "spritebrew-gallery-dev"
+
+[env.preview.observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
