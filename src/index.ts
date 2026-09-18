@@ -21,8 +21,10 @@
 //        with errorCode 'rd_submit_orphaned_redelivery' and ack.
 //      - Legacy running (no taskId, no submitAttemptedAt, within
 //        RUNNING_TIMEOUT_MS)                                   → ack duplicate.
-//   1. Status pre-flight (animate only): GET /v1/status. On non-ok + attempt<3,
-//      msg.retry({delaySeconds:60}). At attempt≥3, proceed regardless.
+//   1. Status pre-flight (animate only): GET /v1/status, reads
+//      status.animations. 'degraded' (present, not "ok") + attempt<3 →
+//      msg.retry({delaySeconds:60}). 'unknown' (field absent, non-2xx, fetch
+//      error) fails open. At attempt≥3, proceed regardless.
 //   2. Write running state (with submitAttemptedAt for animate).
 //   3. RD call:
 //      - create   → callRd (sync, unchanged).
@@ -488,9 +490,12 @@ async function handleMessage(
   }
 
   // === 1. Status pre-flight (animate only). GET is best-effort; a fetch
-  //     error is treated as 'unknown' → fail open → proceed.
+  //     error, non-2xx, or absent status.animations field is 'unknown' →
+  //     fail open → proceed. Only an explicit non-"ok" flag defers. The
+  //     logger is passed so the raw status body lands in this job's log
+  //     stream (one line per call, see checkRdAnimationsStatus).
   if (mode === 'animate') {
-    const rdStatus = await checkRdAnimationsStatus();
+    const rdStatus = await checkRdAnimationsStatus(log);
     const shouldRetry = rdStatus === 'degraded' && attempt < MAX_ATTEMPTS;
     log('info', 'rd status pre-flight', {
       rdStatus,
@@ -884,7 +889,13 @@ async function recordFailure(
   const attempt = msg.attempts ?? 1;
 
   try {
-    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId);
+    // Generation context rides on the tx row's KV metadata so the admin
+    // failure-rate scan can bucket refunds by style without a get() per key.
+    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId, {
+      style: msg.body.body.prompt_style,
+      mode,
+      size: msg.body.body.width,
+    });
     log('info', 'refund applied', {
       alreadyApplied: refundResult.alreadyApplied,
       newBalance: refundResult.newBalance,
@@ -1061,7 +1072,9 @@ async function sweepOne(
 
   const stateKey = `${SWEEP_KEY_PREFIX}${jobId}`;
   try {
-    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId);
+    // The running record carries mode but not style/size (the message is not
+    // in hand during a cron sweep), so the tx metadata gets mode only.
+    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId, { mode });
 
     const errorState: JobStateError = {
       status: 'error',

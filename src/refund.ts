@@ -4,14 +4,20 @@
 // ===============
 // Source of truth: spritebrew/src/lib/tokenBalance.ts (creditTokens function)
 // Canonical interfaces: BalanceRecord (lines 72-76), TransactionRecord (lines 92-101)
-// Last schema review: 2026-05-07 (Session 15 continued morning, post-schema-recon)
+// Tx metadata contract: spritebrew/src/lib/tokenTxMeta.ts (TxMetadata)
+// Last schema review: 2026-09-18 (tx metadata added; record VALUE unchanged)
 //
 // KV keys this file writes (matching Pages-side canonical exactly):
 //   - token_balance:{userId}            → BalanceRecord (3-field, ISO date strings, merge-preserve created_at)
 //   - token_idempotency:refund:{jobId}  → literal string '1'                                 TTL 7d
 //   - token_tx:{userId}:{ts}:{uid}      → TransactionRecord (full canonical shape)           TTL 90d
+//                                         + KV METADATA TxMetadata { type, reason, style?, mode?, size? }
 //
 // Where ts = Date.now() numeric, uid = Math.random().toString(36).slice(2,8) (6-char base36).
+//
+// The metadata is an index, not the record: it lets the Pages admin
+// failure-rate scan classify a row from list() alone instead of paying a
+// get() per key. Undefined context fields are omitted, never written as null.
 //
 // Write ordering matches Pages-side creditTokens (tokenBalance.ts:331-348):
 //   1. Read current balance.
@@ -45,6 +51,34 @@ interface TransactionRecord {
   timestamp: string;
 }
 
+/** Mirror of spritebrew/src/lib/tokenTxMeta.ts::TxMetadata. Keep in sync. */
+interface TxMetadata {
+  type: 'credit' | 'debit';
+  reason: string;
+  style?: string;
+  mode?: 'create' | 'animate';
+  size?: number;
+}
+
+/** Generation context a caller can attach to the refund's tx row. */
+export interface RefundContext {
+  /** RD prompt_style of the failed job, e.g. rd_advanced_animation__walk. */
+  style?: string;
+  mode?: 'create' | 'animate';
+  /** Requested sprite size in px (square). */
+  size?: number;
+}
+
+/** Mirror of tokenTxMeta.ts::txMetadata. Drops undefined/invalid fields so the
+ *  metadata stays compact and well under KV's 1024-byte cap. */
+function txMetadata(type: TxMetadata['type'], reason: string, ctx?: RefundContext): TxMetadata {
+  const meta: TxMetadata = { type, reason };
+  if (typeof ctx?.style === 'string' && ctx.style.length > 0) meta.style = ctx.style;
+  if (ctx?.mode === 'create' || ctx?.mode === 'animate') meta.mode = ctx.mode;
+  if (typeof ctx?.size === 'number' && Number.isFinite(ctx.size)) meta.size = ctx.size;
+  return meta;
+}
+
 const REFUND_IDEMPOTENCY_TTL_S = 60 * 60 * 24 * 7;  // 7 days, matches IDEMPOTENCY_TTL on Pages
 const TX_LOG_TTL_S = 60 * 60 * 24 * 90;              // 90 days, matches TX_TTL on Pages
 
@@ -57,7 +91,8 @@ export async function refundTokens(
   kv: KVNamespace,
   userId: string,
   amount: number,
-  jobId: string
+  jobId: string,
+  ctx?: RefundContext
 ): Promise<RefundResult> {
   const idemKey = `token_idempotency:refund:${jobId}`;
   const idemExisting = await kv.get(idemKey);
@@ -99,7 +134,10 @@ export async function refundTokens(
     balance_after: newBalance,
     timestamp: nowIso,
   };
-  await kv.put(txKey, JSON.stringify(tx), { expirationTtl: TX_LOG_TTL_S });
+  await kv.put(txKey, JSON.stringify(tx), {
+    expirationTtl: TX_LOG_TTL_S,
+    metadata: txMetadata(tx.type, tx.reason, ctx),
+  });
 
   return { alreadyApplied: false, newBalance };
 }

@@ -441,19 +441,58 @@ export async function pollAsyncTask(
 
 // ─── Status pre-flight ─────────────────────────────────────────────────────
 
+/** Minimal logger shape so this file stays free of ../index.ts imports. The
+ *  consumer passes its per-job logger (jobId/userId/attempt context); callers
+ *  without one get a bare JSON console line via defaultStatusLogger. */
+export type RdStatusLogger = (
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  extra?: Record<string, unknown>
+) => void;
+
+const defaultStatusLogger: RdStatusLogger = (level, message, extra = {}) => {
+  console[level](JSON.stringify({ level, message, ...extra }));
+};
+
+// Observed 2026-09-18 (curl, no auth):
+//   { "status": { "rd_fast": "ok", "rd_pro": "ok", "rd_plus": "ok",
+//                 "animations": "ok", "background_removal": "ok" },
+//     "updated_at": 1789701664 }
+// The per-model flags live UNDER `status`, not at the top level. The previous
+// implementation read `data.animations`, which is always undefined on this
+// shape, so every animate pre-flight came back 'degraded' and attempts 1 and
+// 2 of every animate job ate a 60s retry for nothing.
+interface RdStatusResponse {
+  status?: {
+    animations?: unknown;
+    [component: string]: unknown;
+  };
+  updated_at?: number;
+}
+
 /**
  * Best-effort GET https://api.retrodiffusion.ai/v1/status. Returns:
- *   - 'ok'         when response.animations === 'ok'
- *   - 'degraded'   when response.animations is present but not 'ok'
- *   - 'unknown'    on fetch throw, non-2xx, or unparseable JSON (fail open)
+ *   - 'ok'         when response.status.animations is the string 'ok'
+ *   - 'degraded'   when response.status.animations is any other string
+ *   - 'unknown'    when the field is absent or not a string, or on fetch
+ *                  throw, non-2xx, or unparseable JSON (fail open; the
+ *                  caller proceeds)
+ *
+ * Exactly ONE log line per call, whichever branch is taken. On a 2xx JSON
+ * response that line carries the raw parsed body as `rdStatusRaw`, before any
+ * interpretation, so the next shape change shows up in the logs instead of
+ * silently flipping every pre-flight to one verdict again.
  *
  * No auth required by RD for /v1/status; sends UA/Accept anyway for
- * consistency with other requests. 10s timeout — a status check must never
- * hold the worker long enough to matter.
+ * consistency with other requests. 10s timeout, since a status check must
+ * never hold the worker long enough to matter.
  */
-export async function checkRdAnimationsStatus(): Promise<'ok' | 'degraded' | 'unknown'> {
+export async function checkRdAnimationsStatus(
+  log: RdStatusLogger = defaultStatusLogger
+): Promise<'ok' | 'degraded' | 'unknown'> {
+  let resp: Response;
   try {
-    const resp = await fetch(RD_STATUS_URL, {
+    resp = await fetch(RD_STATUS_URL, {
       method: 'GET',
       headers: {
         'User-Agent': HTTP_USER_AGENT,
@@ -461,10 +500,32 @@ export async function checkRdAnimationsStatus(): Promise<'ok' | 'degraded' | 'un
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!resp.ok) return 'unknown';
-    const data = (await resp.json()) as { animations?: unknown };
-    return data.animations === 'ok' ? 'ok' : 'degraded';
-  } catch {
+  } catch (err) {
+    log('warn', 'rd status fetch threw', { error: errorText(err instanceof Error ? err.message : err) });
     return 'unknown';
   }
+
+  if (!resp.ok) {
+    log('warn', 'rd status non-2xx', { httpStatus: resp.status });
+    return 'unknown';
+  }
+
+  let data: RdStatusResponse;
+  try {
+    data = (await resp.json()) as RdStatusResponse;
+  } catch {
+    log('warn', 'rd status non-JSON body', { httpStatus: resp.status });
+    return 'unknown';
+  }
+
+  const animations = data?.status?.animations;
+  const verdict: 'ok' | 'degraded' | 'unknown' =
+    typeof animations !== 'string'
+      ? 'unknown'
+      : animations === 'ok'
+        ? 'ok'
+        : 'degraded';
+
+  log('info', 'rd status raw', { rdStatusRaw: data, animations, verdict });
+  return verdict;
 }
