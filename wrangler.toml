@@ -14,6 +14,11 @@ cpu_ms = 300000  # 5 min defensive headroom (RD calls take 90-120s wall-clock; C
 [env.production]
 name = "spritebrew-rd-consumer"
 
+# A Worker cannot tell from its bindings which environment it runs in; the
+# D1 event ledger stamps every row with this.
+[env.production.vars]
+APP_ENV = "production"
+
 [[env.production.queues.consumers]]
 queue = "spritebrew-rd-jobs"
 max_batch_size = 1                  # one RD call per invocation
@@ -33,6 +38,14 @@ id = "ed99497beaaa432f88000689ab78821c"
 binding = "GALLERY_BUCKET"
 bucket_name = "spritebrew-gallery"
 
+# D1 event ledger (WD2a). Observability only; token_tx:* in KV stays the money
+# truth and recordEvent never blocks or fails a job. Migrations in ./migrations.
+[[env.production.d1_databases]]
+binding = "EVENTS_DB"
+database_name = "spritebrew-events"
+database_id = "fb33d2dc-cfdc-4ed3-9311-12abaf951816"
+migrations_dir = "migrations"
+
 # Observability: enabled in the dashboard 2026-09-18 after the discovery that
 # every log('warn') the consumer writes about an RD failure or a rescue was
 # being discarded. Declared here so a deploy cannot silently switch it back
@@ -48,6 +61,9 @@ persist = true
 # === Preview/dev ===
 [env.preview]
 name = "spritebrew-rd-consumer-dev"
+
+[env.preview.vars]
+APP_ENV = "dev"
 
 [[env.preview.queues.consumers]]
 queue = "spritebrew-rd-jobs-dev"
@@ -67,6 +83,12 @@ id = "18dd9502fdde4a2ea76f9b9eb9cc5e8b"
 [[env.preview.r2_buckets]]
 binding = "GALLERY_BUCKET"
 bucket_name = "spritebrew-gallery-dev"
+
+[[env.preview.d1_databases]]
+binding = "EVENTS_DB"
+database_name = "spritebrew-events-dev"
+database_id = "c7ca1a93-a1f9-477b-b056-1b4f7b434a95"
+migrations_dir = "migrations"
 
 [env.preview.observability.logs]
 enabled = true

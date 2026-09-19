@@ -156,6 +156,13 @@ export type JobState =
 export interface Env {
   SPRITEBREW_KV: KVNamespace;
   GALLERY_BUCKET: R2Bucket;
+  /** D1 event ledger (WD2a). Observability, not money. Typed as required
+   *  because wrangler.toml binds it in both envs; recordEvent still guards
+   *  against a deploy that lacks it and degrades to a warn line. */
+  EVENTS_DB: D1Database;
+  /** 'production' | 'dev', from [env.*.vars] in wrangler.toml. Stamped on
+   *  every ledger row because bindings alone do not say which env this is. */
+  APP_ENV: string;
   RETRO_DIFFUSION_API_KEY: string;
   /**
    * DEV TESTING ONLY. When exactly 'true', animate jobs skip the primary

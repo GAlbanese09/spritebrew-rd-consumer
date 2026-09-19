@@ -67,16 +67,20 @@ import {
   submitAsyncTask,
   pollAsyncTask,
   checkRdAnimationsStatus,
+  probeRdStatus,
   RdError,
 } from './rdClient';
 import { refundTokens } from './refund';
 import { base64ToBytes, writeGalleryEntry } from './gallery';
+import { recordEvent, stageForErrorCode } from './events';
 
 const JOB_TTL_S = 60 * 60;           // 1h — long enough that a refresh recovers; short enough to bound storage.
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
 const STATUS_RETRY_DELAY_S = 60;     // pre-flight backoff between attempts
 const FALLBACK_CELL_SIZE = 64;       // animation__any_animation is 64×64-locked (probe C5)
+const PROVIDER = 'retro-diffusion';  // `provider` column on every ledger row that names one
+const PROBE_SLOT_MS = 15 * 60 * 1000; // provider.status dedupe slot; matches the */15 cron
 
 type Logger = (
   level: 'info' | 'warn' | 'error',
@@ -252,6 +256,18 @@ function isPollBudgetExceeded(err: unknown): boolean {
 }
 
 /**
+ * The taskId a poll-budget error names ("... for task <id>"). The fresh-run
+ * handler does not hold the taskId in a local (runAnimateAsync persisted it
+ * to KV and threw), so the ledger row reads it off the message rather than
+ * spending a KV get. Undefined if the message shape ever changes.
+ */
+function taskIdFromPollError(err: unknown): string | undefined {
+  if (!(err instanceof RdError)) return undefined;
+  const m = /for task (\S+)$/.exec(err.message);
+  return m ? m[1] : undefined;
+}
+
+/**
  * CAS-approximating state write. KV has no compare-and-swap, but re-reading
  * immediately before the put shrinks the redelivery overwrite window from the
  * full handler duration (~150s+) to a few ms. If the state is already terminal
@@ -295,6 +311,9 @@ export default {
     _ctx: ExecutionContext
   ): Promise<void> {
     await sweepStaleRunning(env);
+    // Provider status ledger row every 15 min (WD2a). Own try/catch inside;
+    // cannot affect the sweep.
+    await probeAndRecordProviderStatus(env);
   },
 } satisfies ExportedHandler<Env, JobMessage>;
 
@@ -321,6 +340,19 @@ async function handleMessage(
   };
 
   log('info', 'message received');
+  await recordEvent(env, {
+    eventName: 'queue.message_received',
+    level: 'info',
+    dedupeKey: `${jobId}:queue.message_received:attempt_${attempt}`,
+    userId,
+    jobId,
+    attempt,
+    queueMessageId: msg.id,
+    queueWaitMs: Date.now() - msg.body.enqueuedAt,
+    style: body.prompt_style,
+    requestedSize: `${body.width}x${body.height}`,
+    extra: { mode },
+  }, log);
 
   const stateKey = `job:${jobId}`;
   const stateRaw = await env.SPRITEBREW_KV.get(stateKey);
@@ -411,6 +443,15 @@ async function handleMessage(
           attempt,
           nextAttempt: attempt + 1,
         });
+        await recordEvent(env, {
+          eventName: 'provider.poll_budget_exhausted',
+          level: 'warn',
+          dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
+          userId, jobId, attempt,
+          provider: PROVIDER,
+          providerJobId: state.taskId,
+          extra: { finalAttempt: false },
+        }, log);
         msg.retry({ delaySeconds: 30 });
         return;
       }
@@ -423,6 +464,15 @@ async function handleMessage(
           taskId: state.taskId,
           attempt,
         });
+        await recordEvent(env, {
+          eventName: 'provider.poll_budget_exhausted',
+          level: 'warn',
+          dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
+          userId, jobId, attempt,
+          provider: PROVIDER,
+          providerJobId: state.taskId,
+          extra: { finalAttempt: true },
+        }, log);
       }
       await recordFailure(env, msg, state.startedAt, err, classifyError(err), log);
     }
@@ -538,7 +588,8 @@ async function handleMessage(
             runningState,
             body as RdAnimateBody,
             fallbackInputImage,
-            log
+            log,
+            jobId
           )
         : { result: await callRd(env.RETRO_DIFFUSION_API_KEY, 'create', body) };
 
@@ -559,6 +610,15 @@ async function handleMessage(
     const retryable = isRdError ? err.retryable : true;
     const errMsg = errText(err);
 
+    // The poll-budget ledger rows below need the taskId the error names, and
+    // taskIdFromPollError reads it off a message string. Make a silent break
+    // visible (ruling wd2 003.3): warn once here, still write the rows with
+    // providerJobId absent.
+    const pollTaskId = isPollBudgetExceeded(err) ? taskIdFromPollError(err) : undefined;
+    if (isPollBudgetExceeded(err) && pollTaskId === undefined) {
+      log('warn', 'poll-budget taskId parse failed', { errMsg });
+    }
+
     // Fix 1: poll-budget exhaustion on the FRESH run's primary poll.
     // runAnimateAsync must NOT fallback (see comment there); the task is
     // still live and holds the taskId in state.taskId. Redeliver so guard
@@ -570,6 +630,15 @@ async function handleMessage(
         attempt,
         nextAttempt: attempt + 1,
       });
+      await recordEvent(env, {
+        eventName: 'provider.poll_budget_exhausted',
+        level: 'warn',
+        dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
+        userId, jobId, attempt,
+        provider: PROVIDER,
+        providerJobId: pollTaskId,
+        extra: { finalAttempt: false },
+      }, log);
       msg.retry({ delaySeconds: 30 });
       return;
     }
@@ -578,6 +647,15 @@ async function handleMessage(
         errMsg,
         attempt,
       });
+      await recordEvent(env, {
+        eventName: 'provider.poll_budget_exhausted',
+        level: 'warn',
+        dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
+        userId, jobId, attempt,
+        provider: PROVIDER,
+        providerJobId: pollTaskId,
+        extra: { finalAttempt: true },
+      }, log);
     }
 
     log('error', 'rd call failed', {
@@ -618,7 +696,9 @@ async function runAnimateAsync(
   runningState: JobStateRunning,
   body: RdAnimateBody,
   fallbackInputImage: string | undefined,
-  log: Logger
+  log: Logger,
+  /** For the ledger rows only; the running state does not carry it. */
+  jobId: string
 ): Promise<AnimateOutcome> {
   // Requested geometry, captured before any clamp. `body` is never mutated
   // (the fallback builds a copy), but reading these up front keeps the
@@ -660,6 +740,19 @@ async function runAnimateAsync(
         width: body.width,
         height: body.height,
       });
+      await recordEvent(env, {
+        eventName: 'provider.submit_accepted',
+        level: 'info',
+        dedupeKey: `${jobId}:provider.submit_accepted:${taskId}`,
+        userId: runningState.userId,
+        jobId,
+        attempt: runningState.attempt,
+        provider: PROVIDER,
+        providerJobId: taskId,
+        latencyMs: submitElapsedMs,
+        style: body.prompt_style,
+        requestedSize: `${requestedWidth}x${requestedHeight}`,
+      }, log);
 
       // Persist task_id BEFORE polling so a poll-time crash resumes correctly.
       // Routed through writeStateUnlessTerminal (fix 2): a concurrent
@@ -743,6 +836,24 @@ async function runAnimateAsync(
     taskId: fallbackTaskId,
     submitElapsedMs: fallbackSubmitMs,
   });
+  // Ledger (ruling wd2 003.7): a rescue is the one path where RD bills twice
+  // for one request. style and requestedSize here describe what was actually
+  // submitted (the fallback shape); the customer's ask is on the terminal
+  // generation.rescued row. Distinct dedupe key via the fallback taskId.
+  await recordEvent(env, {
+    eventName: 'provider.submit_accepted',
+    level: 'info',
+    dedupeKey: `${jobId}:provider.submit_accepted:${fallbackTaskId}`,
+    userId: runningState.userId,
+    jobId,
+    attempt: runningState.attempt,
+    provider: PROVIDER,
+    providerJobId: fallbackTaskId,
+    latencyMs: fallbackSubmitMs,
+    style: fallbackBody.prompt_style,
+    requestedSize: `${FALLBACK_CELL_SIZE}x${FALLBACK_CELL_SIZE}`,
+    extra: { fallback: true, primaryError: errText(primaryErr).slice(0, 300) },
+  }, log);
 
   // Overwrite primary's taskId — one taskId in the running state at a time.
   // On redelivery, we resume THIS task (the last one attempted).
@@ -812,6 +923,24 @@ async function recordSuccess(
       preExistingRefunded: pre.refunded,
       rdBalanceCost: result.balance_cost,
     });
+    // Ledger (ruling wd2 003): the rarest and most expensive outcome. RD did
+    // the work and billed it, the customer was already refunded, and nobody
+    // received the image. Own dedupe key; the terminal key belongs to the
+    // failure row that got here first.
+    await recordEvent(env, {
+      eventName: 'generation.orphaned',
+      level: 'error',
+      dedupeKey: `${jobId}:generation.orphaned`,
+      userId,
+      jobId,
+      attempt: msg.attempts ?? 1,
+      provider: PROVIDER,
+      style: body.prompt_style,
+      requestedSize: `${body.width}x${body.height}`,
+      outcome: 'orphaned',
+      errorCode: pre.errorCode,
+      extra: { mode, preExistingRefunded: pre.refunded, rdBalanceCost: result.balance_cost },
+    }, log);
     msg.ack();
     return;
   }
@@ -850,6 +979,28 @@ async function recordSuccess(
     });
     msg.retry();
     return;
+  }
+
+  // Ledger: the one terminal row for this job. Same dedupe key as the
+  // failure row on purpose (a job has one terminal outcome; INSERT OR IGNORE
+  // keeps whichever landed first). Best-effort; cannot throw.
+  {
+    const requestedSize = `${body.width}x${body.height}`;
+    await recordEvent(env, {
+      eventName: rescue ? 'generation.rescued' : 'generation.succeeded',
+      level: 'info',
+      dedupeKey: `${jobId}:generation.terminal`,
+      userId,
+      jobId,
+      attempt: msg.attempts ?? 1,
+      provider: PROVIDER,
+      style: body.prompt_style,
+      requestedSize,
+      finalSize: rescue ? `${rescue.deliveredCellSize}x${rescue.deliveredCellSize}` : requestedSize,
+      outcome: rescue ? 'rescued' : 'succeeded',
+      latencyMs: completedAt - startedAt,
+      extra: { mode, rdBalanceCost: result.balance_cost, rescue },
+    }, log);
   }
 
   const successState: JobStateSuccess = {
@@ -901,6 +1052,39 @@ async function recordFailure(
       newBalance: refundResult.newBalance,
       errorCode,
     });
+
+    // Ledger: terminal failure, then the refund that followed it. Both
+    // best-effort and idempotent; neither can throw, so the refund-then-
+    // terminal-state sequence around them is unchanged. `retryable` uses the
+    // same rule as the catch in handleMessage.
+    const failedEventId = await recordEvent(env, {
+      eventName: 'generation.failed',
+      level: 'error',
+      dedupeKey: `${jobId}:generation.terminal`,
+      userId,
+      jobId,
+      attempt,
+      provider: PROVIDER,
+      style: msg.body.body.prompt_style,
+      requestedSize: `${msg.body.body.width}x${msg.body.body.height}`,
+      outcome: 'failed',
+      errorCode,
+      failureStage: stageForErrorCode(errorCode),
+      retryable: err instanceof RdError ? err.retryable : true,
+      refundExpected: true,
+      latencyMs: Date.now() - startedAt,
+      extra: { mode, errMsg: errMsg.slice(0, 500) },
+    }, log);
+    await recordEvent(env, {
+      eventName: 'generation.refunded',
+      level: 'info',
+      dedupeKey: `${jobId}:generation.refunded`,
+      userId,
+      jobId,
+      unitsDelta: tokenCost,
+      causedByEventId: failedEventId ?? undefined,
+      extra: { alreadyApplied: refundResult.alreadyApplied, newBalance: refundResult.newBalance },
+    }, log);
 
     const errorState: JobStateError = {
       status: 'error',
@@ -1076,6 +1260,35 @@ async function sweepOne(
     // in hand during a cron sweep), so the tx metadata gets mode only.
     const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId, { mode });
 
+    // Ledger: the same terminal pair recordFailure writes. No style or size
+    // here (the sweep has the running record, not the message).
+    const failedEventId = await recordEvent(env, {
+      eventName: 'generation.failed',
+      level: 'error',
+      dedupeKey: `${jobId}:generation.terminal`,
+      userId,
+      jobId,
+      attempt: state.attempt,
+      provider: PROVIDER,
+      outcome: 'failed',
+      errorCode: 'stale_running_swept',
+      failureStage: stageForErrorCode('stale_running_swept'),
+      retryable: false,
+      refundExpected: true,
+      latencyMs: ageMs,
+      extra: { mode, ageMs },
+    }, log);
+    await recordEvent(env, {
+      eventName: 'generation.refunded',
+      level: 'info',
+      dedupeKey: `${jobId}:generation.refunded`,
+      userId,
+      jobId,
+      unitsDelta: tokenCost,
+      causedByEventId: failedEventId ?? undefined,
+      extra: { alreadyApplied: refundResult.alreadyApplied, newBalance: refundResult.newBalance },
+    }, log);
+
     const errorState: JobStateError = {
       status: 'error',
       userId,
@@ -1105,6 +1318,62 @@ async function sweepOne(
       ageMs,
       error: errText(err),
     });
+  }
+}
+
+// ─── Provider status probe (cron, WD2a) ──────────────────────────────────
+
+/**
+ * One provider.status ledger row per 15-minute slot: operational, degraded or
+ * down, with latency, ON FAILURE TOO. A missing row must mean the cron did not
+ * run, never that the probe threw. probeRdStatus never throws and recordEvent
+ * never throws; the try/catch is the last line of defence so nothing here can
+ * reach the sweep that runs before it.
+ */
+async function probeAndRecordProviderStatus(env: Env): Promise<void> {
+  const log: Logger = (level, message, extra = {}) =>
+    console[level](JSON.stringify({ level, message, source: 'provider-status-probe', ...extra }));
+
+  const now = Date.now();
+  // Floor to the quarter hour so a cron that fires twice in one slot writes once.
+  const slot = new Date(Math.floor(now / PROBE_SLOT_MS) * PROBE_SLOT_MS).toISOString();
+
+  try {
+    const probe = await probeRdStatus();
+    const level = probe.verdict === 'operational' ? 'info' : 'warn';
+    log(level, 'provider status probe', {
+      verdict: probe.verdict,
+      httpStatus: probe.httpStatus,
+      latencyMs: probe.latencyMs,
+      slot,
+    });
+    await recordEvent(env, {
+      eventName: 'provider.status',
+      level,
+      dedupeKey: `${PROVIDER}:provider.status:${slot}`,
+      occurredAtMs: now,
+      provider: PROVIDER,
+      providerStatus: probe.verdict,
+      httpStatus: probe.httpStatus ?? undefined,
+      latencyMs: probe.latencyMs,
+      errorCode: probe.verdict === 'down' ? 'probe_down' : undefined,
+      extra: { raw: probe.raw, slot },
+    }, log);
+  } catch (err) {
+    // Should be unreachable (neither callee throws). Still emit the row so
+    // the slot is not silently empty.
+    const error = errText(err);
+    log('warn', 'provider status probe threw', { error, slot });
+    await recordEvent(env, {
+      eventName: 'provider.status',
+      level: 'warn',
+      dedupeKey: `${PROVIDER}:provider.status:${slot}`,
+      occurredAtMs: now,
+      provider: PROVIDER,
+      providerStatus: 'down',
+      errorCode: 'probe_down',
+      extra: { raw: { error }, slot },
+    }, log);
   }
 }
 

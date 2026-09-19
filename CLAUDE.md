@@ -9,3 +9,4 @@ Consumer-specific facts:
 - Workers Observability (logs) is on since Sep 18, 2026 and declared in `wrangler.toml`; keep those blocks.
 - `RETRO_DIFFUSION_API_KEY` is a Worker secret. Never put it in a file.
 - Retro Diffusion's `/v1/status` returns `{"status":{"rd_fast","rd_pro","rd_plus","animations","background_removal"},"updated_at"}`; the fields are nested under `status`.
+- The D1 `events` table (`EVENTS_DB`, `src/events.ts`, migrations in `migrations/`) is observability, not money. `recordEvent` never throws and never blocks or fails a job; `token_tx:` in KV stays the source of truth for balances.

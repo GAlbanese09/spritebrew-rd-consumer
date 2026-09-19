@@ -529,3 +529,71 @@ export async function checkRdAnimationsStatus(
   log('info', 'rd status raw', { rdStatusRaw: data, animations, verdict });
   return verdict;
 }
+
+// ─── Status probe (cron, WD2a) ─────────────────────────────────────────────
+
+export interface RdStatusProbe {
+  httpStatus: number | null;
+  latencyMs: number;
+  /** The parsed body on 2xx JSON; a bounded text snippet on non-2xx; an
+   *  { error } object on a fetch throw; null when the body was not JSON. */
+  raw: unknown;
+  verdict: 'operational' | 'degraded' | 'down';
+}
+
+/**
+ * Whole-provider health for the 15-minute cron ledger row. Distinct from
+ * checkRdAnimationsStatus (the per-job pre-flight, which reads only
+ * status.animations and is unchanged): this one reads every flag.
+ *   - 'operational'  every value under `status` is the string 'ok'
+ *   - 'degraded'     body parsed and has `status`, but some value is not 'ok'
+ *   - 'down'         fetch threw, non-2xx, non-JSON, or no `status` object
+ * Same URL, headers and 10s timeout as the pre-flight. Never throws.
+ */
+export async function probeRdStatus(): Promise<RdStatusProbe> {
+  const startedAt = Date.now();
+  let resp: Response;
+  try {
+    resp = await fetch(RD_STATUS_URL, {
+      method: 'GET',
+      headers: {
+        'User-Agent': HTTP_USER_AGENT,
+        'Accept': HTTP_ACCEPT,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (err) {
+    return {
+      httpStatus: null,
+      latencyMs: Date.now() - startedAt,
+      raw: { error: err instanceof Error ? `${err.name}: ${err.message}` : errorText(err) },
+      verdict: 'down',
+    };
+  }
+  const latencyMs = Date.now() - startedAt;
+
+  if (!resp.ok) {
+    let snippet = '';
+    try {
+      snippet = (await resp.text()).slice(0, 500);
+    } catch {
+      // body unreadable; the status code is the evidence
+    }
+    return { httpStatus: resp.status, latencyMs, raw: snippet, verdict: 'down' };
+  }
+
+  let data: unknown;
+  try {
+    data = await resp.json();
+  } catch {
+    return { httpStatus: resp.status, latencyMs, raw: null, verdict: 'down' };
+  }
+
+  const status = (data as { status?: unknown } | null)?.status;
+  if (!status || typeof status !== 'object' || Array.isArray(status)) {
+    return { httpStatus: resp.status, latencyMs, raw: data, verdict: 'down' };
+  }
+  const values = Object.values(status as Record<string, unknown>);
+  const operational = values.length > 0 && values.every((v) => v === 'ok');
+  return { httpStatus: resp.status, latencyMs, raw: data, verdict: operational ? 'operational' : 'degraded' };
+}
