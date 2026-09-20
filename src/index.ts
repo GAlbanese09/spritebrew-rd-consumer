@@ -73,6 +73,7 @@ import {
 import { refundTokens } from './refund';
 import { base64ToBytes, writeGalleryEntry } from './gallery';
 import { recordEvent, stageForErrorCode } from './events';
+import { runDigestIfDue } from './digest';
 
 const JOB_TTL_S = 60 * 60;           // 1h — long enough that a refresh recovers; short enough to bound storage.
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
@@ -314,6 +315,9 @@ export default {
     // Provider status ledger row every 15 min (WD2a). Own try/catch inside;
     // cannot affect the sweep.
     await probeAndRecordProviderStatus(env);
+    // Morning digest (WD2b): runs only in the 08:00 New York hour, once per
+    // reporting day, capped at 3 attempts. Own try/catch inside.
+    await runDigestIfDue(env);
   },
 } satisfies ExportedHandler<Env, JobMessage>;
 

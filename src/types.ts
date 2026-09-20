@@ -164,6 +164,17 @@ export interface Env {
    *  every ledger row because bindings alone do not say which env this is. */
   APP_ENV: string;
   RETRO_DIFFUSION_API_KEY: string;
+  /** Morning digest (WD2b). RESEND_API_KEY and DIGEST_TO are Worker secrets
+   *  (`wrangler secret put`, per environment); DIGEST_TO is a comma-separated
+   *  recipient list and never appears in a file. DIGEST_FROM is a plain var in
+   *  wrangler.toml. All optional at the type level so a deploy without them
+   *  degrades to a logged outcome rather than a type error. */
+  RESEND_API_KEY?: string;
+  DIGEST_TO?: string;
+  DIGEST_FROM?: string;
+  /** "1" bypasses the 08:00 New York window. Declared under [env.preview.vars]
+   *  only, and the runner ignores it when APP_ENV is 'production'. */
+  DIGEST_FORCE_RUN?: string;
   /**
    * DEV TESTING ONLY. When exactly 'true', animate jobs skip the primary
    * submit and go straight to the fallback, so the rescue path can be
