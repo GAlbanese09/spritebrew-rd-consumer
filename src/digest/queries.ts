@@ -407,7 +407,9 @@ interface ProbeRow {
  * Coverage (probes seen / slots expected) is printed beside uptime so a dead
  * canary can never read as 100%. Expected slots come from the day's half-open
  * UTC range, so a 23 or 25 hour day expects 92 or 100, not 96. For today's
- * (still running) day pass nowMs and the range is clipped to now.
+ * (still running) day pass nowMs and the range is clipped to now. Gaps are
+ * measured only between consecutive observed probes; the day's edges belong
+ * to coverage, not to the gap list.
  */
 export async function providerHealth(
   db: D1Database,
@@ -432,14 +434,18 @@ export async function providerHealth(
   const latencies = rows.map((r) => r.latency_ms).filter((v): v is number => typeof v === 'number').sort((a, b) => a - b);
   const operational = rows.filter((r) => r.provider_status === 'operational').length;
 
-  // Gaps: between consecutive probes, plus the edges of the day.
+  // Gaps: the interval between two CONSECUTIVE OBSERVED probes only. The
+  // edges of the day are not gaps (coverage reports those, and better); a day
+  // with fewer than two probes therefore has zero gaps. Synthesizing an edge
+  // interval fabricated a 1,440 minute alert on a day with no probes at all
+  // (dev, 2026-09-18) and would have opened production's first digest with a
+  // false alert for the hours before the probe existed.
   const gapLimitMs = 20 * 60 * 1000;
   const gapsOver20m: ProbeGap[] = [];
-  const points = [range.startMs, ...rows.map((r) => r.occurred_at_ms), endMs];
-  for (let i = 1; i < points.length; i++) {
-    const span = points[i] - points[i - 1];
+  for (let i = 1; i < rows.length; i++) {
+    const span = rows[i].occurred_at_ms - rows[i - 1].occurred_at_ms;
     if (span > gapLimitMs) {
-      gapsOver20m.push({ fromMs: points[i - 1], toMs: points[i], minutes: Math.round(span / 60000) });
+      gapsOver20m.push({ fromMs: rows[i - 1].occurred_at_ms, toMs: rows[i].occurred_at_ms, minutes: Math.round(span / 60000) });
     }
   }
 

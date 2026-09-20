@@ -22,9 +22,9 @@ APP_ENV = "production"
 # secret put); DIGEST_TO is a comma-separated recipient list and is never a
 # var. DIGEST_FORCE_RUN is deliberately NOT declared here: it exists only under
 # [env.preview.vars], and src/digest/index.ts ignores it when APP_ENV is
-# "production" in any case. The production sender needs spritebrew.com
-# verified in Resend (DNS work pending); until then production is not deployed.
-DIGEST_FROM = "SpriteBrew Ops <digest@spritebrew.com>"
+# "production" in any case. mail.spritebrew.com is the Resend-verified sending
+# domain (verified 2026-09-19 23:50 EDT, us-east-1); the apex is not verified.
+DIGEST_FROM = "SpriteBrew Ops <digest@mail.spritebrew.com>"
 
 [[env.production.queues.consumers]]
 queue = "spritebrew-rd-jobs"
@@ -71,12 +71,12 @@ name = "spritebrew-rd-consumer-dev"
 
 [env.preview.vars]
 APP_ENV = "dev"
-# Resend's test sender: delivers only to the address on the Resend account.
-DIGEST_FROM = "SpriteBrew Ops <onboarding@resend.dev>"
-# Preview only: bypasses the 08:00 New York window so the digest can be
-# exercised on demand. digest_runs idempotency still applies (delete the
-# day's row to re-run). Never add this to [env.production.vars].
-DIGEST_FORCE_RUN = "1"
+DIGEST_FROM = "SpriteBrew Ops <digest@mail.spritebrew.com>"
+# Preview only: DIGEST_FORCE_RUN = "1" bypasses the 08:00 New York window so
+# the digest can be exercised on demand. Uncomment for a test, redeploy dev,
+# then comment it out again. digest_runs idempotency still applies (delete
+# the day's row to re-run). Never add this to [env.production.vars].
+# DIGEST_FORCE_RUN = "1"
 
 [[env.preview.queues.consumers]]
 queue = "spritebrew-rd-jobs-dev"

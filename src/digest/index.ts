@@ -28,7 +28,7 @@
 
 import type { Env } from '../types';
 import { gatherDigest, nyDay, nyHour, previousDay } from './queries';
-import { digestHtml, digestSubject } from './render';
+import { digestHtml, digestSubject, digestText } from './render';
 
 type Logger = (level: 'info' | 'warn' | 'error', message: string, extra?: Record<string, unknown>) => void;
 
@@ -81,7 +81,7 @@ export function parseRecipients(raw: string | undefined): string[] {
 
 /** POST to Resend. Returns the message id. Throws with a bounded message on
  *  any non-2xx; the caller records the error code and retries next slot. */
-async function sendViaResend(env: Env, to: string[], subject: string, html: string): Promise<string> {
+async function sendViaResend(env: Env, to: string[], subject: string, html: string, textBody: string): Promise<string> {
   if (!env.RESEND_API_KEY) throw new Error('resend_key_missing');
   if (!env.DIGEST_FROM) throw new Error('digest_from_missing');
   const resp = await fetch(RESEND_URL, {
@@ -90,7 +90,7 @@ async function sendViaResend(env: Env, to: string[], subject: string, html: stri
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ from: env.DIGEST_FROM, to, subject, html }),
+    body: JSON.stringify({ from: env.DIGEST_FROM, to, subject, html, text: textBody }),
     signal: AbortSignal.timeout(15_000),
   });
   const text = await resp.text();
@@ -151,14 +151,16 @@ export async function runDigestIfDue(env: Env): Promise<void> {
 
     try {
       const data = await gatherDigest(db, day, nowMs);
-      const subject = digestSubject(data);
-      const html = digestHtml(data, env.APP_ENV ?? 'unknown');
+      const environment = env.APP_ENV ?? 'unknown';
+      const subject = digestSubject(data, environment);
+      const html = digestHtml(data, environment);
+      const text = digestText(html);
       if (forced) {
         // Preview only (forced is false in production): the exact document
         // handed to Resend, so a dev run can be verified from the tail.
         log('info', 'digest html (forced run only)', { day, subject, htmlLength: html.length, html });
       }
-      const messageId = await sendViaResend(env, recipients, subject, html);
+      const messageId = await sendViaResend(env, recipients, subject, html, text);
       await writeRun(db, day, 'sent', attempt, nowMs, messageId, null);
       log('info', 'digest sent', {
         day, attempt, resendMessageId: messageId, subject, recipients: recipients.length,
