@@ -374,10 +374,20 @@ export interface FlagNotOk {
   value: string;
 }
 
+export interface AnimationsNotOk {
+  atMs: number;
+  /** RD's value for status.animations, or 'absent' when the key was missing. */
+  value: string;
+}
+
 export interface Tripwires {
   warnTwoConsecutiveOver3s: boolean;
   alertSingleOver10s: boolean;
   alertGapOver20m: boolean;
+  /** status.animations anything other than the string 'ok', absence
+   *  included. Separate from the generic flag count because an absent or
+   *  non-ok animations flag is the TF-004 pre-flight failure shape. */
+  alertAnimationsNotOk: boolean;
   fired: string[];
 }
 
@@ -393,6 +403,7 @@ export interface ProviderHealth {
   maxMs: number | null;
   gapsOver20m: ProbeGap[];
   flagsNotOk: FlagNotOk[];
+  animationsNotOk: AnimationsNotOk[];
   tripwires: Tripwires;
 }
 
@@ -450,7 +461,11 @@ export async function providerHealth(
   }
 
   // Flags: every value under extra.raw.status that is not the string 'ok'.
+  // A value of 'unknown' here is what RD RETURNED (seen 2026-09-19 18:00 and
+  // 18:15 on background_removal); a key RD omitted never reaches this loop.
+  // The animations flag is therefore checked explicitly, presence included.
   const flagsNotOk: FlagNotOk[] = [];
+  const animationsNotOk: AnimationsNotOk[] = [];
   for (const r of rows) {
     try {
       const raw = (JSON.parse(r.event_json) as { extra?: { raw?: { status?: Record<string, unknown> } } }).extra?.raw?.status;
@@ -458,11 +473,18 @@ export async function providerHealth(
         for (const [flag, value] of Object.entries(raw)) {
           if (value !== 'ok') flagsNotOk.push({ atMs: r.occurred_at_ms, flag, value: String(value) });
         }
-      } else if (r.provider_status !== 'operational') {
-        flagsNotOk.push({ atMs: r.occurred_at_ms, flag: 'probe', value: r.provider_status ?? 'unknown' });
+        if (raw.animations !== 'ok') {
+          animationsNotOk.push({ atMs: r.occurred_at_ms, value: raw.animations === undefined ? 'absent' : String(raw.animations) });
+        }
+      } else {
+        if (r.provider_status !== 'operational') {
+          flagsNotOk.push({ atMs: r.occurred_at_ms, flag: 'probe', value: r.provider_status ?? 'unknown' });
+        }
+        animationsNotOk.push({ atMs: r.occurred_at_ms, value: 'absent' });
       }
     } catch {
       flagsNotOk.push({ atMs: r.occurred_at_ms, flag: 'event_json', value: 'unparseable' });
+      animationsNotOk.push({ atMs: r.occurred_at_ms, value: 'absent' });
     }
   }
 
@@ -474,10 +496,15 @@ export async function providerHealth(
   }
   const alertSingle = series.some((v) => v > 10_000);
   const alertGap = gapsOver20m.length > 0;
+  const alertAnimations = animationsNotOk.length > 0;
   const fired: string[] = [];
   if (warnTwo) fired.push('warn: two consecutive probes over 3,000 ms');
   if (alertSingle) fired.push('alert: a probe over 10,000 ms');
-  if (alertGap) fired.push('alert: a probe slot gap over 20 minutes');
+  if (alertGap) fired.push(`alert: ${gapsOver20m.length} gap${gapsOver20m.length === 1 ? '' : 's'} over 20 minutes between consecutive probes`);
+  if (alertAnimations) {
+    const values = Array.from(new Set(animationsNotOk.map((a) => a.value))).join(', ');
+    fired.push(`alert: animations flag not ok on ${animationsNotOk.length} probe${animationsNotOk.length === 1 ? '' : 's'} (${values})`);
+  }
 
   return {
     probes: rows.length,
@@ -491,8 +518,62 @@ export async function providerHealth(
     maxMs: latencies.length ? latencies[latencies.length - 1] : null,
     gapsOver20m,
     flagsNotOk,
-    tripwires: { warnTwoConsecutiveOver3s: warnTwo, alertSingleOver10s: alertSingle, alertGapOver20m: alertGap, fired },
+    animationsNotOk,
+    tripwires: {
+      warnTwoConsecutiveOver3s: warnTwo,
+      alertSingleOver10s: alertSingle,
+      alertGapOver20m: alertGap,
+      alertAnimationsNotOk: alertAnimations,
+      fired,
+    },
   };
+}
+
+// ─── 7. Missed digests (the one case a missing email reaches nobody) ───────
+
+export interface MissedDigest {
+  day: string;
+  /** 'failed' with attempts and the last error, or 'no row' when no slot ever
+   *  ran for that day (Worker down, cron not firing). */
+  state: string;
+  attempts: number | null;
+  errorCode: string | null;
+}
+
+/**
+ * Prior days in the last seven whose digest never went out: rows in
+ * digest_runs whose state is not 'sent', plus days with no row at all once the
+ * digest existed (days before the first row ever are not missed, they are
+ * pre-launch). Never throws; on any error returns [] so it can never block the
+ * current day's send.
+ */
+export async function missedDigests(db: D1Database, day: string): Promise<MissedDigest[]> {
+  try {
+    const from = previousDay(day, 7);
+    const to = previousDay(day, 1);
+    const [{ results }, first] = await Promise.all([
+      db
+        .prepare('SELECT reporting_day, state, attempts, error_code FROM digest_runs WHERE reporting_day BETWEEN ?1 AND ?2 ORDER BY reporting_day')
+        .bind(from, to)
+        .all<{ reporting_day: string; state: string; attempts: number | null; error_code: string | null }>(),
+      db.prepare('SELECT MIN(reporting_day) AS first_day FROM digest_runs').first<{ first_day: string | null }>(),
+    ]);
+    const rows = new Map((results ?? []).map((r) => [r.reporting_day, r]));
+    const firstDay = first?.first_day ?? null;
+    const missed: MissedDigest[] = [];
+    for (let n = 7; n >= 1; n--) {
+      const d = previousDay(day, n);
+      const r = rows.get(d);
+      if (r) {
+        if (r.state !== 'sent') missed.push({ day: d, state: r.state, attempts: r.attempts, errorCode: r.error_code });
+      } else if (firstDay !== null && d > firstDay) {
+        missed.push({ day: d, state: 'no row', attempts: null, errorCode: null });
+      }
+    }
+    return missed;
+  } catch {
+    return [];
+  }
 }
 
 // ─── All six, for one reporting day ────────────────────────────────────────
@@ -506,16 +587,18 @@ export interface DigestData {
   abandoned: AbandonedPaid;
   poll: PollHeadroom;
   provider: ProviderHealth;
+  missed: MissedDigest[];
 }
 
 export async function gatherDigest(db: D1Database, day: string, nowMs: number): Promise<DigestData> {
-  const [styleSize, trendData, refunds, abandoned, poll, provider] = await Promise.all([
+  const [styleSize, trendData, refunds, abandoned, poll, provider, missed] = await Promise.all([
     byStyleAndSize(db, day),
     trend(db, day),
     refundsExpectedVsIssued(db, day, nowMs),
     abandonedPaidTasks(db, day),
     pollHeadroom(db, day),
     providerHealth(db, day, nowMs),
+    missedDigests(db, day),
   ]);
-  return { day, generatedAtMs: nowMs, styleSize, trend: trendData, refunds, abandoned, poll, provider };
+  return { day, generatedAtMs: nowMs, styleSize, trend: trendData, refunds, abandoned, poll, provider, missed };
 }

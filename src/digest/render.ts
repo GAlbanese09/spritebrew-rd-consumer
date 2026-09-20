@@ -43,6 +43,12 @@ function id8(v: string | null | undefined): string {
   return v ? v.slice(0, 8) : 'unknown';
 }
 
+/** Display form of a style: the shared animation prefix carries no
+ *  information on a phone and is the largest single cause of overflow. */
+function styleLabel(style: string): string {
+  return style.startsWith('rd_advanced_animation__') ? style.slice('rd_advanced_animation__'.length) : style;
+}
+
 const NY_TIME = new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/New_York', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
 });
@@ -89,6 +95,14 @@ export function digestHtml(d: DigestData, environment: string): string {
   parts.push(`<h1 style="${FONT};font-size:18px;line-height:1.3;font-weight:600;margin:0 0 4px;color:#111111">SpriteBrew Daily ${esc(d.day)}${environment === 'production' ? '' : ` <span style="color:#555555;font-weight:400">[${esc(environment)}]</span>`}</h1>`);
   parts.push(`<p style="${MUTED}">Reporting day ${esc(d.day)} America/New_York. Generated ${esc(nyDateTime(d.generatedAtMs))} from the ${esc(environment)} event ledger. Money truth stays in the KV token ledger; this is observability.</p>`);
 
+  // 0. Missed digests: the one case where a missing email reaches nobody.
+  for (const m of d.missed) {
+    const detail = m.state === 'no row'
+      ? 'no slot ran'
+      : `${m.attempts ?? 0} attempt${m.attempts === 1 ? '' : 's'}, last error ${esc(m.errorCode ?? 'none recorded')}`;
+    parts.push(`<p style="${P}"><span style="${ALARM}">No digest was sent for ${esc(m.day)}</span> (${detail}).</p>`);
+  }
+
   // 1. Abandoned paid tasks (money wasted). Own number, never in the failure rate.
   const ab = d.abandoned;
   parts.push(`<h2 style="${H2}">Abandoned paid tasks: <span style="${ab.count ? ALARM : OK}">${ab.count}</span> (${esc(ab.totalUsd.toFixed(2))} USD at ${esc(ab.pricePerCallUsd.toFixed(3))} per call)</h2>`);
@@ -105,7 +119,7 @@ export function digestHtml(d: DigestData, environment: string): string {
   const tw = d.provider.tripwires;
   parts.push(`<h2 style="${H2}">Tripwires: <span style="${tw.fired.length ? ALARM : OK}">${tw.fired.length ? `${tw.fired.length} fired` : 'none fired'}</span></h2>`);
   if (tw.fired.length) parts.push(`<ul style="${P};padding-left:18px">${tw.fired.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>`);
-  parts.push(`<p style="${MUTED}">Thresholds are provisional (warn: two consecutive probes over 3,000 ms; alert: any probe over 10,000 ms; alert: any gap over 20 minutes between consecutive probes). Set from seven samples on 2026-09-19 and due for retuning from the real p95 after seven days.</p>`);
+  parts.push(`<p style="${MUTED}">Thresholds are provisional (warn: two consecutive probes over 3,000 ms; alert: any probe over 10,000 ms; alert: any gap over 20 minutes between consecutive probes; alert: the animations flag anything but ok, absence included). Set from seven samples on 2026-09-19 and due for retuning from the real p95 after seven days.</p>`);
 
   // 4. Failure rate with trend: four columns, count and share in one cell.
   parts.push(`<h2 style="${H2}">Failure rate: ${pctStr(t.yesterday.failureRatePct)} yesterday (${t.yesterday.failed} of ${t.yesterday.total})</h2>`);
@@ -121,7 +135,7 @@ export function digestHtml(d: DigestData, environment: string): string {
   parts.push(`<h2 style="${H2}">Poll budget headroom: <span style="${po.over80Pct ? ALARM : OK}">${po.over80Pct} job${po.over80Pct === 1 ? '' : 's'} over 80%</span> of ${po.budgetMs.toLocaleString('en-US')} ms</h2>`);
   parts.push(table(['jobs', 'p50', 'p95', 'max'],
     [[esc(po.jobs), msStr(po.p50Ms), po.p95Ms === null ? 'n/a' : `${msStr(po.p95Ms)} (${pctStr(po.p95PctOfBudget)})`, po.maxMs === null ? 'n/a' : `${msStr(po.maxMs)} (${pctStr(po.maxPctOfBudget)})`]]));
-  parts.push(`<p style="${MUTED}">Terminal latency_ms is the poll duration of the operation the event names. Percentages are of the 180,000 ms budget. The leading indicator for the next refund wave.</p>`);
+  parts.push(`<p style="${MUTED}">On a terminal row, latency_ms is how long the job spent waiting on Retro Diffusion for its result. Percentages are of the 180,000 ms poll budget. This is the leading indicator for the next refund wave.</p>`);
 
   // 6. Provider health: two lines of text, coverage beside uptime.
   const pv = d.provider;
@@ -147,7 +161,7 @@ export function digestHtml(d: DigestData, environment: string): string {
   parts.push(`<h2 style="${H2}">Yesterday by style and size</h2>`);
   parts.push(table(['style / size', 'total', 'succeeded', 'failed'],
     d.styleSize.map((r) => [
-      `${esc(r.style)}<br>${esc(r.requestedSize)}`,
+      `${esc(styleLabel(r.style))} ${esc(r.requestedSize)}`,
       esc(r.total),
       r.rescued ? `${r.succeeded + r.rescued} (${r.rescued} rescued)` : esc(r.succeeded),
       countPct(r.failed, r.failureRatePct),
