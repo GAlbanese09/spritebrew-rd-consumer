@@ -73,9 +73,9 @@ import {
 import { refundTokens } from './refund';
 import { base64ToBytes, writeGalleryEntry } from './gallery';
 import { recordEvent, stageForErrorCode } from './events';
+import { putJobState } from './jobState';
 import { runDigestIfDue } from './digest';
 
-const JOB_TTL_S = 60 * 60;           // 1h — long enough that a refresh recovers; short enough to bound storage.
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
 const STATUS_RETRY_DELAY_S = 60;     // pre-flight backoff between attempts
@@ -292,9 +292,9 @@ async function writeStateUnlessTerminal(
     });
     return;
   }
-  await env.SPRITEBREW_KV.put(stateKey, JSON.stringify(nextState), {
-    expirationTtl: JOB_TTL_S,
-  });
+  // Every caller builds stateKey as `job:{jobId}` (the sweep through
+  // SWEEP_KEY_PREFIX); putJobState rebuilds it from the jobId.
+  await putJobState(env, stateKey.slice('job:'.length), nextState, log);
 }
 
 export default {
@@ -579,9 +579,7 @@ async function handleMessage(
   if (mode === 'animate') {
     runningState.submitAttemptedAt = startedAt;
   }
-  await env.SPRITEBREW_KV.put(stateKey, JSON.stringify(runningState), {
-    expirationTtl: JOB_TTL_S,
-  });
+  await putJobState(env, jobId, runningState, log);
 
   // === 3. Call RD.
   try {
