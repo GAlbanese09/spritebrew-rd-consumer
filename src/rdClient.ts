@@ -321,15 +321,22 @@ export async function submitAsyncTask(
  * (result.error → error → message → `rd_task_${status}`).
  * On budget exhaustion: throws RdError with message containing
  * "exceeded budget" so the caller can map to errorCode 'rd_async_timeout'.
+ *
+ * `pollFirst` skips the sleep before the first poll. Only the redelivery
+ * resume (guard 0c) sets it: that task has already run for a full budget and
+ * may be finished. A fresh submit keeps sleeping first (RD's animate minimum
+ * is about 46 s).
  */
 export async function pollAsyncTask(
   apiKey: string,
   taskId: string,
-  budgetMs = 180_000
+  budgetMs = 180_000,
+  options: { pollFirst?: boolean } = {}
 ): Promise<RdSuccessResponse> {
   const startedAt = Date.now();
   const pollUrl = `${RD_API_URL}/tasks/${taskId}`;
   let unknownStatusStreak = 0;
+  let skipSleep = options.pollFirst === true;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -342,8 +349,12 @@ export async function pollAsyncTask(
       );
     }
     // 5s ±1s jitter — 4000..6000ms.
-    const delayMs = 4000 + Math.floor(Math.random() * 2000);
-    await new Promise((r) => setTimeout(r, delayMs));
+    if (skipSleep) {
+      skipSleep = false;
+    } else {
+      const delayMs = 4000 + Math.floor(Math.random() * 2000);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
 
     let resp: Response;
     try {

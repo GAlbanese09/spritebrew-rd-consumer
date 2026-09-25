@@ -420,7 +420,8 @@ async function handleMessage(
       resumingRescue: state.rescue !== undefined,
     });
     try {
-      const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, state.taskId);
+      // Poll before sleeping: this task already ran a full budget and may be done.
+      const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, state.taskId, undefined, { pollFirst: true });
       log('info', 'resume-poll succeeded', {
         taskId: state.taskId,
         balance_cost: result.balance_cost,
@@ -456,7 +457,8 @@ async function handleMessage(
           providerJobId: state.taskId,
           extra: { finalAttempt: false },
         }, log);
-        msg.retry({ delaySeconds: 30 });
+        // No delay: the task is still live on RD and may already be done.
+        msg.retry({ delaySeconds: 0 });
         return;
       }
       // Final attempt or non-budget error → terminal.
@@ -642,7 +644,8 @@ async function handleMessage(
         providerJobId: pollTaskId,
         extra: { finalAttempt: false },
       }, log);
-      msg.retry({ delaySeconds: 30 });
+      // No delay: the task is still live on RD and may already be done.
+      msg.retry({ delaySeconds: 0 });
       return;
     }
     if (isPollBudgetExceeded(err)) {
