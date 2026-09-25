@@ -527,6 +527,7 @@ async function handleMessage(
     state?.status === 'running' &&
     !state.taskId &&
     !state.submitAttemptedAt &&
+    !state.releasedAt &&
     Date.now() - state.startedAt < RUNNING_TIMEOUT_MS
   ) {
     if (attempt === 1) {
@@ -676,6 +677,13 @@ async function handleMessage(
     // safety: submit orphans, per receipt 6, must not resubmit) so they'll
     // skip this branch and fall through to refund.
     if (retryable && attempt < MAX_ATTEMPTS) {
+      // Create only: this invocation's call has ended, so release the record
+      // and let the next delivery run at once instead of being deferred by
+      // the legacy-running guard. Animate records are not touched: this
+      // local copy lacks the taskId persisted after submit.
+      if (mode === 'create') {
+        await writeStateUnlessTerminal(env, stateKey, { ...runningState, releasedAt: Date.now() }, log);
+      }
       msg.retry();
       return;
     }

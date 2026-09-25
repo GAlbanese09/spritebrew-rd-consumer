@@ -72,6 +72,14 @@ export interface JobStateRunning {
    */
   submitAttemptedAt?: number;
   /**
+   * Create path only. Set by the invocation that ran the RD call, after the
+   * call returned a retryable error and just before msg.retry(), so the next
+   * delivery knows no invocation is still inside the call and runs at once
+   * instead of being deferred by the legacy-running guard. A fresh running
+   * write never carries it.
+   */
+  releasedAt?: number;
+  /**
    * Set immediately AFTER the async submit response yields a task_id
    * (animate/async path only). On redelivery with this present + no terminal
    * status, resume polling this exact task; do not resubmit.

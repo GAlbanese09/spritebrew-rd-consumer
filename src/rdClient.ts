@@ -121,7 +121,10 @@ export async function callRd(
 
   if (!resp.ok) {
     // 429 and 5xx are retryable; 4xx (except 429) are not — likely a bad payload.
-    const retryable = resp.status === 429 || resp.status >= 500;
+    // 524 is not: Cloudflare in front of RD timed out while RD's origin held
+    // the call, the same case as our own timeout above. RD may have done and
+    // billed the work, and a retry holds the call as long again.
+    const retryable = resp.status === 429 || (resp.status >= 500 && resp.status !== 524);
     throw new RdError(
       `RD ${resp.status}: ${text.slice(0, 500)}`,
       resp.status,
