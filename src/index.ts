@@ -23,8 +23,8 @@
 //        RUNNING_TIMEOUT_MS)                                   → ack duplicate.
 //   1. Status pre-flight (animate only): GET /v1/status, reads
 //      status.animations. 'degraded' (present, not "ok") + attempt<3 →
-//      msg.retry({delaySeconds:60}). 'unknown' (field absent, non-2xx, fetch
-//      error) fails open. At attempt≥3, proceed regardless.
+//      msg.retry({delaySeconds:60}). RD's own "unknown" and 'absent' (field
+//      absent, non-2xx, fetch error) fail open. At attempt≥3, proceed regardless.
 //   2. Write running state (with submitAttemptedAt for animate).
 //   3. RD call:
 //      - create   → callRd (sync, unchanged).
@@ -544,8 +544,9 @@ async function handleMessage(
   }
 
   // === 1. Status pre-flight (animate only). GET is best-effort; a fetch
-  //     error, non-2xx, or absent status.animations field is 'unknown' →
-  //     fail open → proceed. Only an explicit non-"ok" flag defers. The
+  //     error, non-2xx, or absent status.animations field is 'absent' →
+  //     fail open → proceed. RD's own "unknown" also proceeds. Only another
+  //     explicit non-"ok" flag ('degraded') defers. The
   //     logger is passed so the raw status body lands in this job's log
   //     stream (one line per call, see checkRdAnimationsStatus).
   if (mode === 'animate') {

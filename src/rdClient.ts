@@ -471,12 +471,28 @@ interface RdStatusResponse {
 }
 
 /**
+ * Pure verdict on RD's status.animations value; see checkRdAnimationsStatus.
+ * Only 'degraded' defers a job.
+ */
+export function rdAnimationsVerdict(animations: unknown): 'ok' | 'unknown' | 'degraded' | 'absent' {
+  if (typeof animations !== 'string') return 'absent';
+  if (animations === 'ok') return 'ok';
+  if (animations === 'unknown') return 'unknown';
+  return 'degraded';
+}
+
+/**
  * Best-effort GET https://api.retrodiffusion.ai/v1/status. Returns:
  *   - 'ok'         when response.status.animations is the string 'ok'
- *   - 'degraded'   when response.status.animations is any other string
- *   - 'unknown'    when the field is absent or not a string, or on fetch
+ *   - 'unknown'    when it is RD's own string 'unknown' (fail open: RD has
+ *                  reported this for hours at a time while animations ran
+ *                  normally, and deferring it pushed every animation onto
+ *                  its final attempt)
+ *   - 'degraded'   when it is any other string (the caller defers)
+ *   - 'absent'     when the field is absent or not a string, or on fetch
  *                  throw, non-2xx, or unparseable JSON (fail open; the
- *                  caller proceeds)
+ *                  caller proceeds). Named apart from RD's 'unknown' so the
+ *                  logs cannot confuse our failure to read with RD's value.
  *
  * Exactly ONE log line per call, whichever branch is taken. On a 2xx JSON
  * response that line carries the raw parsed body as `rdStatusRaw`, before any
@@ -489,7 +505,7 @@ interface RdStatusResponse {
  */
 export async function checkRdAnimationsStatus(
   log: RdStatusLogger = defaultStatusLogger
-): Promise<'ok' | 'degraded' | 'unknown'> {
+): Promise<'ok' | 'unknown' | 'degraded' | 'absent'> {
   let resp: Response;
   try {
     resp = await fetch(RD_STATUS_URL, {
@@ -502,12 +518,12 @@ export async function checkRdAnimationsStatus(
     });
   } catch (err) {
     log('warn', 'rd status fetch threw', { error: errorText(err instanceof Error ? err.message : err) });
-    return 'unknown';
+    return 'absent';
   }
 
   if (!resp.ok) {
     log('warn', 'rd status non-2xx', { httpStatus: resp.status });
-    return 'unknown';
+    return 'absent';
   }
 
   let data: RdStatusResponse;
@@ -515,16 +531,11 @@ export async function checkRdAnimationsStatus(
     data = (await resp.json()) as RdStatusResponse;
   } catch {
     log('warn', 'rd status non-JSON body', { httpStatus: resp.status });
-    return 'unknown';
+    return 'absent';
   }
 
   const animations = data?.status?.animations;
-  const verdict: 'ok' | 'degraded' | 'unknown' =
-    typeof animations !== 'string'
-      ? 'unknown'
-      : animations === 'ok'
-        ? 'ok'
-        : 'degraded';
+  const verdict = rdAnimationsVerdict(animations);
 
   log('info', 'rd status raw', { rdStatusRaw: data, animations, verdict });
   return verdict;
