@@ -73,8 +73,9 @@ import {
 import { refundTokens } from './refund';
 import { base64ToBytes, writeGalleryEntry } from './gallery';
 import { recordEvent, stageForErrorCode } from './events';
-import { putJobState } from './jobState';
+import { putJobState, writeStateUnlessTerminal } from './jobState';
 import { runDigestIfDue } from './digest';
+import { DEAD_LETTER_QUEUES, handleDeadLetter } from './deadLetter';
 
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
@@ -268,37 +269,15 @@ function taskIdFromPollError(err: unknown): string | undefined {
   return m ? m[1] : undefined;
 }
 
-/**
- * CAS-approximating state write. KV has no compare-and-swap, but re-reading
- * immediately before the put shrinks the redelivery overwrite window from the
- * full handler duration (~150s+) to a few ms. If the state is already terminal
- * (success or error), we skip the write and log the attempted transition — a
- * slower invocation cannot then clobber a terminal state a faster concurrent
- * redelivery already committed. Route every non-initial state write through
- * this: taskId-persist after submit, recordSuccess, recordFailure.
- */
-async function writeStateUnlessTerminal(
-  env: Env,
-  stateKey: string,
-  nextState: JobState,
-  log: Logger
-): Promise<void> {
-  const raw = await env.SPRITEBREW_KV.get(stateKey);
-  const cur = raw ? (JSON.parse(raw) as JobState) : null;
-  if (cur?.status === 'success' || cur?.status === 'error') {
-    log('warn', 'state already terminal - write skipped', {
-      currentStatus: cur.status,
-      attemptedStatus: nextState.status,
-    });
-    return;
-  }
-  // Every caller builds stateKey as `job:{jobId}` (the sweep through
-  // SWEEP_KEY_PREFIX); putJobState rebuilds it from the jobId.
-  await putJobState(env, stateKey.slice('job:'.length), nextState, log);
-}
-
 export default {
   async queue(batch: MessageBatch<JobMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    // Dead letters: exact queue names only (deadLetter.ts).
+    if (DEAD_LETTER_QUEUES.has(batch.queue)) {
+      for (const msg of batch.messages) {
+        await handleDeadLetter(msg, env);
+      }
+      return;
+    }
     for (const msg of batch.messages) {
       await handleMessage(msg, env);
     }

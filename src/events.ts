@@ -105,6 +105,7 @@ export function stageForErrorCode(code: string | undefined): string {
   if (code.startsWith('rd_submit_orphaned')) return 'submit';
   if (code === 'rd_sync_timeout') return 'sync';
   if (code === 'stale_running_swept') return 'sweep';
+  if (code === 'dead_lettered') return 'queue';
   if (code.startsWith('rd_')) return 'provider';          // rd_<http status>
   return 'unknown';                                        // consumer_unknown and anything new
 }

@@ -65,10 +65,60 @@ async function putJobStateR2(env: Env, jobId: string, body: string, log: Logger)
 /**
  * Writes the job record to R2 (jobs/{jobId}.json), then to KV (job:{jobId}),
  * byte for byte the same JSON. Unconditional: callers that must not overwrite
- * a terminal state go through writeStateUnlessTerminal in index.ts.
+ * a terminal state go through writeStateUnlessTerminal below.
  */
 export async function putJobState(env: Env, jobId: string, state: JobState, log: Logger): Promise<void> {
   const body = JSON.stringify(state);
   await putJobStateR2(env, jobId, body, log);
   await env.SPRITEBREW_KV.put(`job:${jobId}`, body, { expirationTtl: JOB_TTL_S });
+}
+
+/**
+ * CAS-approximating state write. KV has no compare-and-swap, but re-reading
+ * immediately before the put shrinks the redelivery overwrite window from the
+ * full handler duration (~150s+) to a few ms. If the state is already terminal
+ * (success or error), we skip the write and log the attempted transition: a
+ * slower invocation cannot then clobber a terminal state a faster concurrent
+ * redelivery already committed. Route every non-initial state write through
+ * this: taskId-persist after submit, recordSuccess, recordFailure, and the
+ * dead-letter handler.
+ */
+export async function writeStateUnlessTerminal(
+  env: Env,
+  stateKey: string,
+  nextState: JobState,
+  log: Logger
+): Promise<void> {
+  const raw = await env.SPRITEBREW_KV.get(stateKey);
+  const cur = raw ? (JSON.parse(raw) as JobState) : null;
+  if (cur?.status === 'success' || cur?.status === 'error') {
+    log('warn', 'state already terminal - write skipped', {
+      currentStatus: cur.status,
+      attemptedStatus: nextState.status,
+    });
+    return;
+  }
+  // Every caller builds stateKey as `job:{jobId}` (the sweep through
+  // SWEEP_KEY_PREFIX); putJobState rebuilds it from the jobId.
+  await putJobState(env, stateKey.slice('job:'.length), nextState, log);
+}
+
+/**
+ * The job record, strong store first: the R2 mirror, then KV. Returns the
+ * parsed record and where it came from, or null when neither holds one (or
+ * neither parses). Read failures count as a miss.
+ */
+export async function readJobState(
+  env: Env,
+  jobId: string
+): Promise<{ state: JobState; source: 'r2' | 'kv' } | null> {
+  try {
+    const obj = await env.GALLERY_BUCKET.get(jobStateR2Key(jobId));
+    if (obj) return { state: JSON.parse(await obj.text()) as JobState, source: 'r2' };
+  } catch { /* fall through to KV */ }
+  try {
+    const raw = await env.SPRITEBREW_KV.get(`job:${jobId}`);
+    if (raw) return { state: JSON.parse(raw) as JobState, source: 'kv' };
+  } catch { /* miss */ }
+  return null;
 }
