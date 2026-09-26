@@ -141,7 +141,9 @@ function table(headers: string[], rows: string[][]): string {
 export function digestSubject(d: DigestData, environment: string): string {
   const t = d.trend.yesterday;
   const tag = environment === 'production' ? '' : `[${environment}] `;
-  return `${tag}SpriteBrew Daily ${d.day}: ${t.failed} of ${t.total} failed, ${d.abandoned.count} abandoned paid`;
+  const unended = d.unended.length ? `, ${d.unended.length} unended` : '';
+  const unrefunded = d.unrefunded.length ? `, ${d.unrefunded.length} unrefunded` : '';
+  return `${tag}SpriteBrew Daily ${d.day}: ${t.failed} of ${t.total} failed, ${d.abandoned.count} abandoned paid${unended}${unrefunded}`;
 }
 
 export function digestHtml(d: DigestData, environment: string): string {
@@ -157,6 +159,22 @@ export function digestHtml(d: DigestData, environment: string): string {
       ? 'no slot ran'
       : `${m.attempts ?? 0} attempt${m.attempts === 1 ? '' : 's'}, last error ${esc(m.errorCode ?? 'none recorded')}`;
     parts.push(`<p ${P}><span ${ALARM}>No digest was sent for ${esc(m.day)}</span> (${detail}).</p>`);
+  }
+
+  // 0b. Jobs that neither delivered nor failed: a lost customer or a lost row.
+  const un = d.unended;
+  parts.push(`<h2 ${H2}>No ending row after 45 minutes: <span ${un.length ? ALARM : OK}>${un.length}</span></h2>`);
+  parts.push(`<p ${P}>A job with a receipt row yesterday and no succeeded, rescued or failed row at all. Check each against its KV or R2 record: a lost ledger row is not a lost customer, but a job with neither an image nor a refund is.</p>`);
+  parts.push(table(['job', 'first receipt (ET)', 'attempts'],
+    un.map((x) => [esc(id8(x.jobId)), esc(nyTime(x.firstReceiptMs)), esc(x.attempts)])));
+
+  // 0c. Dead letters the consumer could not refund.
+  const ur = d.unrefunded;
+  parts.push(`<h2 ${H2}>Dead letters not refunded: <span ${ur.length ? ALARM : OK}>${ur.length}</span></h2>`);
+  if (ur.length) {
+    parts.push(`<p ${P}>The dead-letter consumer gave up or could not read the message. The customer may still be charged: settle each by hand.</p>`);
+    parts.push(table(['job', 'at (ET)', 'reason', 'tokens'],
+      ur.map((x) => [esc(id8(x.jobId)), esc(nyTime(x.occurredAtMs)), esc(x.reason ?? ''), esc(x.tokenCost ?? '')])));
   }
 
   // 1. Abandoned paid tasks (money wasted). Own number, never in the failure rate.

@@ -576,7 +576,88 @@ export async function missedDigests(db: D1Database, day: string): Promise<Missed
   }
 }
 
-// ─── All six, for one reporting day ────────────────────────────────────────
+// ─── 8. Jobs with no ending, and dead letters left unrefunded ──────────────
+
+/** A job this young may still be running; the longest legitimate path is
+ *  about 13 minutes plus the 20-minute sweep and one 15-minute cron. */
+export const UNENDED_GRACE_MS = 45 * 60 * 1000;
+
+export interface UnendedJob {
+  jobId: string;
+  userId: string | null;
+  firstReceiptMs: number;
+  lastReceiptMs: number;
+  attempts: number;
+}
+
+/**
+ * Every job with a queue.message_received row on the day and no
+ * generation.succeeded, .rescued or .failed row at all (whatever day that row
+ * carries), whose last receipt is older than UNENDED_GRACE_MS at nowMs. A
+ * listed job is a lost customer or a lost ledger row: check its KV or R2 record
+ * before acting.
+ */
+export async function unendedJobs(db: D1Database, day: string, nowMs: number): Promise<UnendedJob[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT r.job_id AS job_id, MAX(r.user_id) AS user_id,
+              MIN(r.occurred_at_ms) AS first_ms, MAX(r.occurred_at_ms) AS last_ms,
+              MAX(r.attempt) AS attempts
+         FROM events r
+        WHERE r.event_name = 'queue.message_received'
+          AND r.reporting_day = ?1
+          AND r.job_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM events t
+                           WHERE t.job_id = r.job_id
+                             AND t.event_name IN ('generation.succeeded', 'generation.rescued', 'generation.failed'))
+        GROUP BY r.job_id
+       HAVING MAX(r.occurred_at_ms) < ?2
+        ORDER BY first_ms`
+    )
+    .bind(day, nowMs - UNENDED_GRACE_MS)
+    .all<{ job_id: string; user_id: string | null; first_ms: number; last_ms: number; attempts: number | null }>();
+  return (results ?? []).map((r) => ({
+    jobId: r.job_id,
+    userId: r.user_id,
+    firstReceiptMs: r.first_ms,
+    lastReceiptMs: r.last_ms,
+    attempts: r.attempts ?? 1,
+  }));
+}
+
+export interface UnrefundedAlarm {
+  jobId: string | null;
+  userId: string | null;
+  occurredAtMs: number;
+  reason: string | null;
+  tokenCost: number | null;
+}
+
+/** generation.unrefunded rows: the dead-letter consumer gave up on a job
+ *  (retries exhausted) or could not validate its message. Each is a customer
+ *  who may still be charged; settle by hand. */
+export async function unrefundedAlarms(db: D1Database, day: string): Promise<UnrefundedAlarm[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT job_id, user_id, occurred_at_ms,
+              json_extract(event_json, '$.extra.reason') AS reason,
+              json_extract(event_json, '$.extra.tokenCost') AS token_cost
+         FROM events
+        WHERE event_name = 'generation.unrefunded' AND reporting_day = ?1
+        ORDER BY occurred_at_ms`
+    )
+    .bind(day)
+    .all<{ job_id: string | null; user_id: string | null; occurred_at_ms: number; reason: string | null; token_cost: number | null }>();
+  return (results ?? []).map((r) => ({
+    jobId: r.job_id,
+    userId: r.user_id,
+    occurredAtMs: r.occurred_at_ms,
+    reason: r.reason,
+    tokenCost: typeof r.token_cost === 'number' ? r.token_cost : null,
+  }));
+}
+
+// ─── All of them, for one reporting day ────────────────────────────────────────
 
 export interface DigestData {
   day: string;
@@ -588,10 +669,12 @@ export interface DigestData {
   poll: PollHeadroom;
   provider: ProviderHealth;
   missed: MissedDigest[];
+  unended: UnendedJob[];
+  unrefunded: UnrefundedAlarm[];
 }
 
 export async function gatherDigest(db: D1Database, day: string, nowMs: number): Promise<DigestData> {
-  const [styleSize, trendData, refunds, abandoned, poll, provider, missed] = await Promise.all([
+  const [styleSize, trendData, refunds, abandoned, poll, provider, missed, unended, unrefunded] = await Promise.all([
     byStyleAndSize(db, day),
     trend(db, day),
     refundsExpectedVsIssued(db, day, nowMs),
@@ -599,6 +682,11 @@ export async function gatherDigest(db: D1Database, day: string, nowMs: number): 
     pollHeadroom(db, day),
     providerHealth(db, day, nowMs),
     missedDigests(db, day),
+    unendedJobs(db, day, nowMs),
+    unrefundedAlarms(db, day),
   ]);
-  return { day, generatedAtMs: nowMs, styleSize, trend: trendData, refunds, abandoned, poll, provider, missed };
+  return {
+    day, generatedAtMs: nowMs, styleSize, trend: trendData, refunds, abandoned, poll, provider, missed,
+    unended, unrefunded,
+  };
 }
