@@ -40,6 +40,7 @@ dead_letter_queue = "spritebrew-rd-jobs-dlq"
 queue = "spritebrew-rd-jobs-dlq"
 max_batch_size = 1
 max_batch_timeout = 0
+max_concurrency = 1                 # one dead letter at a time: no two deliveries of one job in parallel
 max_retries = 5
 retry_delay = 60
 
@@ -99,6 +100,7 @@ dead_letter_queue = "spritebrew-rd-jobs-dlq-dev"
 queue = "spritebrew-rd-jobs-dlq-dev"
 max_batch_size = 1
 max_batch_timeout = 0
+max_concurrency = 1
 max_retries = 5
 retry_delay = 60
 

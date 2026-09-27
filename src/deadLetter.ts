@@ -47,6 +47,12 @@ const DLQ_LAST_ATTEMPT = 6;
  *  record the sweep skips (one without tokenCost). */
 const RUNNING_GRACE_MS = 40 * 60 * 1000;
 
+/** Older than this, a dead letter is not auto-refunded: an alarm row instead.
+ *  Every auto-refund then stays inside the life of the refund key, including
+ *  keys written with the old 7-day TTL, so "no evidence of a refund" still
+ *  means "not refunded". Past it the evidence may have expired. */
+const STALE_AFTER_MS = 6 * 24 * 60 * 60 * 1000;
+
 /** Largest price today is 50 (styleRegistry.ts getTokenCost). */
 const MAX_TOKEN_COST = 50;
 
@@ -191,6 +197,19 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
     const refundedRecord = record?.state.status === 'error' && record.state.refunded === true;
     if (refundedRecord || (await d1HasRow(env, f.jobId, ['generation.refunded']))) {
       log('info', 'dead letter already refunded', { by: refundedRecord ? `${record?.source}_record` : 'd1_row' });
+      msg.ack();
+      return;
+    }
+
+    // Too old to trust the absence of refund evidence: alarm, never refund.
+    const now = Date.now();
+    const sentAtMs =
+      typeof b.enqueuedAt === 'number' && Number.isFinite(b.enqueuedAt) && b.enqueuedAt <= now
+        ? b.enqueuedAt
+        : msg.timestamp.getTime();
+    const messageAgeMs = now - sentAtMs;
+    if (messageAgeMs > STALE_AFTER_MS) {
+      await alarm(env, msg, 'stale_message', f, log, `age ${(messageAgeMs / 3_600_000).toFixed(1)} h`);
       msg.ack();
       return;
     }

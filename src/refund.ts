@@ -79,7 +79,10 @@ function txMetadata(type: TxMetadata['type'], reason: string, ctx?: RefundContex
   return meta;
 }
 
-const REFUND_IDEMPOTENCY_TTL_S = 60 * 60 * 24 * 7;  // 7 days, matches IDEMPOTENCY_TTL on Pages
+// 30 days. Deliberately longer than the Pages debit key (IDEMPOTENCY_TTL, 7
+// days): this key must outlive the dead-letter queue's 14-day retention with
+// margin, so a dead letter handled late still finds the refund it already got.
+const REFUND_IDEMPOTENCY_TTL_S = 60 * 60 * 24 * 30;
 const TX_LOG_TTL_S = 60 * 60 * 24 * 90;              // 90 days, matches TX_TTL on Pages
 
 export interface RefundResult {
