@@ -341,6 +341,9 @@ export async function pollHeadroom(db: D1Database, day: string, budgetMs = POLL_
     .prepare(
       `SELECT latency_ms FROM events
         WHERE reporting_day = ?1 AND event_name IN ${TERMINAL} AND latency_ms IS NOT NULL
+          -- A sweep row's latency_ms is the stale record's age, not time spent
+          -- waiting on Retro Diffusion, so it has no place in poll headroom.
+          AND (error_code IS NULL OR error_code <> 'stale_running_swept')
         ORDER BY latency_ms`
     )
     .bind(day)
