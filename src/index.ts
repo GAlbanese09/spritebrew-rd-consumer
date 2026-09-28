@@ -76,6 +76,7 @@ import { recordEvent, stageForErrorCode } from './events';
 import { putJobState, writeStateUnlessTerminal } from './jobState';
 import { runDigestIfDue } from './digest';
 import { DEAD_LETTER_QUEUES, handleDeadLetter } from './deadLetter';
+import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
 
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
@@ -383,6 +384,30 @@ async function handleMessage(
     return;
   }
 
+  // === 0f. A refund owed from a failure while money was paused (n1-ledger
+  //     005 section 4). The job never runs again and RD is never called: make
+  //     the refund once money reopens, else wait.
+  if (state?.status === 'running' && state.refundDue) {
+    if (await isMoneyPaused(env)) {
+      const delaySeconds = await pausedRetryDelayS(env);
+      log('info', 'refund due but money paused; retrying later', {
+        errorCode: state.refundDue.errorCode,
+        delaySeconds,
+      });
+      msg.retry({ delaySeconds });
+      return;
+    }
+    await recordFailure(
+      env,
+      msg,
+      state.startedAt,
+      new Error(state.refundDue.error ?? 'generation failed while money writes were paused'),
+      state.refundDue.errorCode,
+      log
+    );
+    return;
+  }
+
   // === 0c. Redelivery with taskId → resume polling that task.
   //     Applies to any running-state that captured a taskId (animate today).
   //     We SKIP status pre-flight and SKIP submission entirely: the task
@@ -461,6 +486,22 @@ async function handleMessage(
       }
       await recordFailure(env, msg, state.startedAt, err, classifyError(err), log);
     }
+    return;
+  }
+
+  // === Money pause gate (n1-ledger 007 section 4, rulings A and B). After
+  //     0c (a resume poll bills nothing) and before 0d, 0e, the pre-flight
+  //     and the running write: while paused, nothing is written and RD is
+  //     not called. The message is held; past its last delivery it
+  //     dead-letters and the dead-letter handler refunds it after the pause.
+  if (await isMoneyPaused(env)) {
+    const delaySeconds = await pausedRetryDelayS(env);
+    log('warn', 'money paused; holding message, no RD call', {
+      delaySeconds,
+      recordStatus: state?.status ?? 'absent',
+      lastDelivery: attempt > MAX_ATTEMPTS,
+    });
+    msg.retry({ delaySeconds });
     return;
   }
 
@@ -1032,6 +1073,33 @@ async function recordFailure(
   const errMsg = errText(err);
   const attempt = msg.attempts ?? 1;
 
+  // Money paused (n1-ledger 005 section 4): no refund now. Record that one is
+  // owed, then retry; guard 0f makes it once money reopens. Nothing is
+  // acked, so the message (or its dead letter) carries the debt.
+  if (await isMoneyPaused(env)) {
+    const delaySeconds = await pausedRetryDelayS(env);
+    const owed: JobStateRunning = {
+      status: 'running',
+      userId,
+      mode,
+      enqueuedAt: msg.body.enqueuedAt,
+      startedAt,
+      attempt,
+      tokenCost,
+      refundDue: { errorCode, at: Date.now(), error: errMsg.slice(0, 500) },
+    };
+    try {
+      await writeStateUnlessTerminal(env, stateKey, owed, log);
+    } catch (writeErr) {
+      // The retry still carries the debt; 0f or the dead-letter handler
+      // settles it from the message.
+      log('error', 'refund-due record write failed', { error: errText(writeErr) });
+    }
+    log('warn', 'money paused; refund deferred', { errorCode, delaySeconds });
+    msg.retry({ delaySeconds });
+    return;
+  }
+
   try {
     // Generation context rides on the tx row's KV metadata so the admin
     // failure-rate scan can bucket refunds by style without a get() per key.
@@ -1179,6 +1247,12 @@ async function sweepStaleRunning(env: Env): Promise<void> {
   const log: Logger = (level, message, extra = {}) =>
     console[level](JSON.stringify({ level, message, source: 'stale-running-sweep', ...extra }));
 
+  // Every sweep action is a refund: none while money is paused.
+  if (await isMoneyPaused(env)) {
+    log('info', 'money paused; sweep skipped');
+    return;
+  }
+
   log('info', 'sweep started', {
     staleAfterMs: SWEEP_STALE_AFTER_MS,
     maxPerRun: SWEEP_MAX_PER_RUN,
@@ -1248,6 +1322,8 @@ async function sweepOne(
   }
 
   const stateKey = `${SWEEP_KEY_PREFIX}${jobId}`;
+  // A record left owing a refund from a paused failure keeps its own code.
+  const errorCode = state.refundDue?.errorCode ?? 'stale_running_swept';
   try {
     // The running record carries mode but not style/size (the message is not
     // in hand during a cron sweep), so the tx metadata gets mode only.
@@ -1264,8 +1340,8 @@ async function sweepOne(
       attempt: state.attempt,
       provider: PROVIDER,
       outcome: 'failed',
-      errorCode: 'stale_running_swept',
-      failureStage: stageForErrorCode('stale_running_swept'),
+      errorCode,
+      failureStage: stageForErrorCode(errorCode),
       retryable: false,
       refundExpected: true,
       latencyMs: ageMs,
@@ -1288,8 +1364,8 @@ async function sweepOne(
       mode,
       enqueuedAt: state.enqueuedAt,
       failedAt: Date.now(),
-      error: `stale running record swept after ${Math.round(ageMs / 1000)}s`,
-      errorCode: 'stale_running_swept',
+      error: state.refundDue?.error ?? `stale running record swept after ${Math.round(ageMs / 1000)}s`,
+      errorCode,
       attempts: state.attempt,
       refunded: !refundResult.alreadyApplied,
     };

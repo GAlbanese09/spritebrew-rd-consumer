@@ -15,7 +15,10 @@
 //   4. A running record younger than 40 minutes may be a live duplicate
 //      delivery still working, or one the sweep is about to refund: retry the
 //      message once that age is reached.
-//   5. Refund, then the D1 rows, then the terminal record, in recordFailure's
+//   5. Money paused (n1-ledger 008 ruling A): no refund and no ack. Retry
+//      every 900 s; the last paused delivery writes the alarm (reason
+//      'paused') and George settles it after the unpause.
+//   6. Refund, then the D1 rows, then the terminal record, in recordFailure's
 //      order, the record through writeStateUnlessTerminal.
 //
 // A throw retries through the queue (max_retries 5, retry_delay 60 s, no DLQ
@@ -26,6 +29,7 @@ import type { Env, JobMessage, JobMode, JobStateError } from './types';
 import { refundTokens } from './refund';
 import { recordEvent, stageForErrorCode } from './events';
 import { readJobState, writeStateUnlessTerminal } from './jobState';
+import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
 
 /** Exact names, per environment. No prefix match: a future queue whose name
  *  starts the same way must never be refunded by accident. */
@@ -139,6 +143,19 @@ async function alarm(
 ): Promise<void> {
   const b = (msg.body ?? {}) as Partial<JobMessage>;
   const jobId = typeof b.jobId === 'string' ? b.jobId : undefined;
+  // Evidence for settling by hand (n1-ledger 007 section 4): does KV hold the
+  // refund key, and does D1 hold a generation.refunded row (evidence, not
+  // proof). Only for a job id that passed validation.
+  let legacyRefundEvidence: string | undefined;
+  let d1RefundedEvent: boolean | undefined;
+  if (f.jobId) {
+    try {
+      legacyRefundEvidence = (await env.SPRITEBREW_KV.get(`token_idempotency:refund:${f.jobId}`)) ? 'kv:present' : 'kv:absent';
+    } catch {
+      legacyRefundEvidence = 'kv:unreadable';
+    }
+    d1RefundedEvent = await d1HasRow(env, f.jobId, ['generation.refunded']);
+  }
   // console.error with the fields is the record of last resort if D1 is the
   // thing failing.
   console.error(JSON.stringify({
@@ -151,6 +168,8 @@ async function alarm(
     tokenCost: b.tokenCost,
     attempt: msg.attempts,
     detail,
+    legacyRefundEvidence,
+    d1RefundedEvent,
   }));
   await recordEvent(env, {
     eventName: 'generation.unrefunded',
@@ -161,7 +180,7 @@ async function alarm(
     queueMessageId: msg.id,
     attempt: msg.attempts,
     errorCode: ERROR_CODE,
-    extra: { reason, tokenCost: b.tokenCost, detail: detail?.slice(0, 500) },
+    extra: { reason, tokenCost: b.tokenCost, detail: detail?.slice(0, 500), legacyRefundEvidence, d1RefundedEvent },
   }, log);
 }
 
@@ -222,6 +241,21 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
         msg.retry({ delaySeconds });
         return;
       }
+    }
+
+    // Money paused: no refund, and no ack without a settlement. The last
+    // paused delivery leaves the alarm instead (a retry then would delete
+    // the message; there is no queue behind this one).
+    if (await isMoneyPaused(env)) {
+      if (attempt >= DLQ_LAST_ATTEMPT) {
+        await alarm(env, msg, 'paused', f, log, 'money paused through the last dead-letter delivery');
+        msg.ack();
+        return;
+      }
+      const delaySeconds = await pausedRetryDelayS(env);
+      log('warn', 'money paused; dead letter held, no refund', { delaySeconds });
+      msg.retry({ delaySeconds });
+      return;
     }
 
     // Refund, then the D1 rows, then the terminal record (recordFailure's order).

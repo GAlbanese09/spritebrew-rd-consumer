@@ -103,6 +103,18 @@ export interface JobStateRunning {
     requestedHeight: number;
     deliveredCellSize: number;
   };
+  /**
+   * A refund owed but not made because money writes were paused
+   * (n1-ledger.md 005 section 4). Written by recordFailure instead of the
+   * refund; the next delivery (guard 0f), the sweep or the dead-letter
+   * handler makes the refund once money reopens. The job never runs again.
+   */
+  refundDue?: {
+    errorCode: string;
+    at: number;
+    /** The failure's message, for the error record written with the refund. */
+    error?: string;
+  };
 }
 
 export interface JobStateSuccess {
@@ -168,6 +180,10 @@ export interface Env {
    *  because wrangler.toml binds it in both envs; recordEvent still guards
    *  against a deploy that lacks it and degrades to a warn line. */
   EVENTS_DB: D1Database;
+  /** `spritebrew-ledger` (n1-ledger.md 005). Release 1 reads only its
+   *  `control` table: the money pause, and `dev_fault` on dev. Optional at the
+   *  type level; a deploy without it reads as paused (fail closed). */
+  LEDGER_DB?: D1Database;
   /** 'production' | 'dev', from [env.*.vars] in wrangler.toml. Stamped on
    *  every ledger row because bindings alone do not say which env this is. */
   APP_ENV: string;
