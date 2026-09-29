@@ -16,8 +16,11 @@
 //      delivery still working, or one the sweep is about to refund: retry the
 //      message once that age is reached.
 //   5. Money paused (n1-ledger 008 ruling A): no refund and no ack. Retry
-//      every 900 s; the last paused delivery writes the alarm (reason
-//      'paused') and George settles it after the unpause.
+//      every 900 s. The last paused delivery acks only once the alarm row
+//      (reason 'paused') is proven written. If it is not, the debt goes into
+//      the job record as `refundDue` with a 24-hour TTL, which the sweep
+//      settles after the unpause; if that write fails too, the loss is
+//      logged at error level (n1-ledger-02.md 002 ruling A).
 //   6. Refund, then the D1 rows, then the terminal record, in recordFailure's
 //      order, the record through writeStateUnlessTerminal.
 //
@@ -25,11 +28,11 @@
 // of its own). The last delivery writes an alarm instead of vanishing: an
 // error log and a D1 generation.unrefunded row, which the digest lists.
 
-import type { Env, JobMessage, JobMode, JobStateError } from './types';
+import type { Env, JobMessage, JobMode, JobStateError, JobStateRunning } from './types';
 import { refundTokens } from './refund';
-import { recordEvent, stageForErrorCode } from './events';
-import { readJobState, writeStateUnlessTerminal } from './jobState';
-import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
+import { recordEvent, recordEventOrThrow, stageForErrorCode } from './events';
+import { DEBT_TTL_S, readJobState, writeStateUnlessTerminal } from './jobState';
+import { devFaults, isMoneyPaused, pausedRetryDelayS } from './moneyPause';
 
 /** Exact names, per environment. No prefix match: a future queue whose name
  *  starts the same way must never be refunded by accident. */
@@ -140,7 +143,7 @@ async function alarm(
   f: Partial<ValidFields>,
   log: Logger,
   detail?: string
-): Promise<void> {
+): Promise<boolean> {
   const b = (msg.body ?? {}) as Partial<JobMessage>;
   const jobId = typeof b.jobId === 'string' ? b.jobId : undefined;
   // Evidence for settling by hand (n1-ledger 007 section 4): does KV hold the
@@ -171,17 +174,27 @@ async function alarm(
     legacyRefundEvidence,
     d1RefundedEvent,
   }));
-  await recordEvent(env, {
-    eventName: 'generation.unrefunded',
-    level: 'error',
-    dedupeKey: `${jobId ?? `msg:${msg.id}`}:generation.unrefunded`,
-    userId: f.userId,
-    jobId,
-    queueMessageId: msg.id,
-    attempt: msg.attempts,
-    errorCode: ERROR_CODE,
-    extra: { reason, tokenCost: b.tokenCost, detail: detail?.slice(0, 500), legacyRefundEvidence, d1RefundedEvent },
-  }, log);
+  // The row is the proof the digest lists, so this write is strict: the
+  // caller learns whether it landed (n1-ledger-02.md 002 ruling A). The dev
+  // fault 'events_db_absent' makes it behave as an unbound EVENTS_DB.
+  const eventsEnv = (await devFaults(env)).includes('events_db_absent') ? { ...env, EVENTS_DB: undefined } : env;
+  try {
+    await recordEventOrThrow(eventsEnv as Env, {
+      eventName: 'generation.unrefunded',
+      level: 'error',
+      dedupeKey: `${jobId ?? `msg:${msg.id}`}:generation.unrefunded`,
+      userId: f.userId,
+      jobId,
+      queueMessageId: msg.id,
+      attempt: msg.attempts,
+      errorCode: ERROR_CODE,
+      extra: { reason, tokenCost: b.tokenCost, detail: detail?.slice(0, 500), legacyRefundEvidence, d1RefundedEvent },
+    });
+    return true;
+  } catch (err) {
+    log('error', 'alarm row not written', { reason, error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
 }
 
 export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Promise<void> {
@@ -243,13 +256,58 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
       }
     }
 
-    // Money paused: no refund, and no ack without a settlement. The last
-    // paused delivery leaves the alarm instead (a retry then would delete
-    // the message; there is no queue behind this one).
+    const mode: JobMode =
+      b.mode === 'create' || b.mode === 'animate' ? b.mode : record?.state.mode ?? 'create';
+
+    // Money paused: no refund, and no ack without a settlement. A retry at
+    // the last delivery deletes the message (there is no queue behind this
+    // one), so the last paused delivery acks only when the alarm row is
+    // proven, and otherwise leaves the debt in the job record first.
     if (await isMoneyPaused(env)) {
       if (attempt >= DLQ_LAST_ATTEMPT) {
-        await alarm(env, msg, 'paused', f, log, 'money paused through the last dead-letter delivery');
-        msg.ack();
+        if (await alarm(env, msg, 'paused', f, log, 'money paused through the last dead-letter delivery')) {
+          msg.ack();
+          return;
+        }
+        const now = Date.now();
+        const owed: JobStateRunning = {
+          status: 'running',
+          userId: f.userId,
+          mode,
+          enqueuedAt: typeof b.enqueuedAt === 'number' ? b.enqueuedAt : now,
+          startedAt: record?.state.status === 'running' ? record.state.startedAt : now,
+          attempt,
+          tokenCost: f.tokenCost,
+          refundDue: { errorCode: ERROR_CODE, at: now, error: 'This generation could not be started.' },
+        };
+        let kept = false;
+        try {
+          kept = await writeStateUnlessTerminal(env, `job:${f.jobId}`, owed, log, DEBT_TTL_S);
+        } catch (err) {
+          log('error', 'refund-due record write failed', { error: err instanceof Error ? err.message : String(err) });
+        }
+        if (kept) {
+          log('warn', 'alarm row not written; debt kept as a refund-due record (24 h) for the sweep', {
+            tokenCost: f.tokenCost,
+          });
+        } else {
+          // Neither the row nor the record exists: this line is the only
+          // evidence left. Every field the alarm carries.
+          console.error(JSON.stringify({
+            level: 'error',
+            message: 'dead letter lost unsettled: no alarm row and no refund-due record',
+            source: 'dead-letter',
+            reason: 'paused',
+            jobId: f.jobId,
+            userId: f.userId,
+            tokenCost: f.tokenCost,
+            mode,
+            attempt,
+            queueMessageId: msg.id,
+            recordStatus: record?.state.status ?? 'absent',
+          }));
+        }
+        msg.retry();
         return;
       }
       const delaySeconds = await pausedRetryDelayS(env);
@@ -259,8 +317,6 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
     }
 
     // Refund, then the D1 rows, then the terminal record (recordFailure's order).
-    const mode: JobMode =
-      b.mode === 'create' || b.mode === 'animate' ? b.mode : record?.state.mode ?? 'create';
     const refundResult = await refundTokens(env.SPRITEBREW_KV, f.userId, f.tokenCost, f.jobId, { mode });
     log('info', 'dead letter refunded', {
       alreadyApplied: refundResult.alreadyApplied,

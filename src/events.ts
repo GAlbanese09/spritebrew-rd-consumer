@@ -10,6 +10,10 @@
 //   - is idempotent through dedupe_key (INSERT OR IGNORE), so a queue retry
 //     never double-counts and a redelivery can call it again freely.
 //
+// One exception (n1-ledger-02.md 002 ruling A): where the row itself is the
+// proof of a debt, the dead-letter alarm, recordEventOrThrow reports failure
+// by throwing, so the caller can keep the debt somewhere else.
+//
 // Schema: migrations/0001_events.sql. Typed columns are the query surface;
 // the full canonical object lives in event_json (sorted keys) with its
 // SHA-256 in event_sha256, so a row can be proven byte-for-byte later and a
@@ -139,6 +143,84 @@ function bool01(v: boolean | undefined): number | null {
 }
 
 /**
+ * The insert itself. Throws on any D1 error. Returns the row's event_id, or
+ * on a dedupe hit the id of the row that already holds this dedupe_key.
+ * Returns null when INSERT OR IGNORE wrote nothing and no row holds the key
+ * (a CHECK failure is ignored the same way as a duplicate).
+ */
+async function insertEvent(db: D1Database, env: Env, evt: LedgerEvent): Promise<string | null> {
+  const eventId = crypto.randomUUID();
+  const occurredAtMs = evt.occurredAtMs ?? Date.now();
+  const ingestedAtMs = Date.now();
+  const day = reportingDay(occurredAtMs);
+  const environment = typeof env.APP_ENV === 'string' && env.APP_ENV ? env.APP_ENV : 'unknown';
+
+  // Everything, typed columns included, in one object: the row's typed
+  // columns are a projection of this, never the other way round.
+  const canonical = {
+    schemaVersion: SCHEMA_VERSION,
+    eventId,
+    dedupeKey: evt.dedupeKey,
+    eventName: evt.eventName,
+    level: evt.level,
+    occurredAtMs,
+    occurredAt: new Date(occurredAtMs).toISOString(),
+    reportingDay: day,
+    ingestedAtMs,
+    environment,
+    sourceService: SOURCE_SERVICE,
+    userId: evt.userId,
+    jobId: evt.jobId,
+    requestId: evt.requestId,
+    queueMessageId: evt.queueMessageId,
+    provider: evt.provider,
+    providerJobId: evt.providerJobId,
+    attempt: evt.attempt,
+    style: evt.style,
+    requestedSize: evt.requestedSize,
+    finalSize: evt.finalSize,
+    outcome: evt.outcome,
+    providerStatus: evt.providerStatus,
+    errorCode: evt.errorCode,
+    failureStage: evt.failureStage,
+    httpStatus: evt.httpStatus,
+    retryable: evt.retryable,
+    refundExpected: evt.refundExpected,
+    latencyMs: evt.latencyMs,
+    queueWaitMs: evt.queueWaitMs,
+    unitsDelta: evt.unitsDelta,
+    causedByEventId: evt.causedByEventId,
+    extra: evt.extra,
+  };
+  const eventJson = stableStringify(canonical);
+  const eventSha256 = await sha256Hex(eventJson);
+
+  const result = await db
+    .prepare(INSERT_SQL)
+    .bind(
+      eventId, evt.dedupeKey, SCHEMA_VERSION, evt.eventName, evt.level,
+      occurredAtMs, day, ingestedAtMs, environment, SOURCE_SERVICE,
+      null, evt.userId ?? null, evt.jobId ?? null, evt.requestId ?? null, evt.queueMessageId ?? null,
+      evt.provider ?? null, evt.providerJobId ?? null, evt.attempt ?? null, evt.style ?? null, evt.requestedSize ?? null,
+      evt.finalSize ?? null, evt.outcome ?? null, evt.providerStatus ?? null, evt.errorCode ?? null, evt.failureStage ?? null,
+      evt.httpStatus ?? null, bool01(evt.retryable), bool01(evt.refundExpected), evt.latencyMs ?? null, evt.queueWaitMs ?? null,
+      null, null, evt.unitsDelta ?? null, evt.causedByEventId ?? null, eventJson, eventSha256
+    )
+    .run();
+
+  if (result.meta.changes === 0) {
+    // Dedupe hit: a previous delivery already wrote this key. Return its
+    // id so a follow-on causedByEventId points at the row that exists.
+    const existing = await db
+      .prepare('SELECT event_id FROM events WHERE dedupe_key = ?1')
+      .bind(evt.dedupeKey)
+      .first<{ event_id: string }>();
+    return existing?.event_id ?? null;
+  }
+  return eventId;
+}
+
+/**
  * Write one event. Returns the row's event_id on success (on a dedupe hit,
  * the id of the row that already holds this dedupe_key, so causedByEventId
  * chains stay honest across redeliveries), or null on any failure. Never
@@ -163,75 +245,7 @@ export async function recordEvent(
       return null;
     }
 
-    const eventId = crypto.randomUUID();
-    const occurredAtMs = evt.occurredAtMs ?? Date.now();
-    const ingestedAtMs = Date.now();
-    const day = reportingDay(occurredAtMs);
-    const environment = typeof env.APP_ENV === 'string' && env.APP_ENV ? env.APP_ENV : 'unknown';
-
-    // Everything, typed columns included, in one object: the row's typed
-    // columns are a projection of this, never the other way round.
-    const canonical = {
-      schemaVersion: SCHEMA_VERSION,
-      eventId,
-      dedupeKey: evt.dedupeKey,
-      eventName: evt.eventName,
-      level: evt.level,
-      occurredAtMs,
-      occurredAt: new Date(occurredAtMs).toISOString(),
-      reportingDay: day,
-      ingestedAtMs,
-      environment,
-      sourceService: SOURCE_SERVICE,
-      userId: evt.userId,
-      jobId: evt.jobId,
-      requestId: evt.requestId,
-      queueMessageId: evt.queueMessageId,
-      provider: evt.provider,
-      providerJobId: evt.providerJobId,
-      attempt: evt.attempt,
-      style: evt.style,
-      requestedSize: evt.requestedSize,
-      finalSize: evt.finalSize,
-      outcome: evt.outcome,
-      providerStatus: evt.providerStatus,
-      errorCode: evt.errorCode,
-      failureStage: evt.failureStage,
-      httpStatus: evt.httpStatus,
-      retryable: evt.retryable,
-      refundExpected: evt.refundExpected,
-      latencyMs: evt.latencyMs,
-      queueWaitMs: evt.queueWaitMs,
-      unitsDelta: evt.unitsDelta,
-      causedByEventId: evt.causedByEventId,
-      extra: evt.extra,
-    };
-    const eventJson = stableStringify(canonical);
-    const eventSha256 = await sha256Hex(eventJson);
-
-    const result = await db
-      .prepare(INSERT_SQL)
-      .bind(
-        eventId, evt.dedupeKey, SCHEMA_VERSION, evt.eventName, evt.level,
-        occurredAtMs, day, ingestedAtMs, environment, SOURCE_SERVICE,
-        null, evt.userId ?? null, evt.jobId ?? null, evt.requestId ?? null, evt.queueMessageId ?? null,
-        evt.provider ?? null, evt.providerJobId ?? null, evt.attempt ?? null, evt.style ?? null, evt.requestedSize ?? null,
-        evt.finalSize ?? null, evt.outcome ?? null, evt.providerStatus ?? null, evt.errorCode ?? null, evt.failureStage ?? null,
-        evt.httpStatus ?? null, bool01(evt.retryable), bool01(evt.refundExpected), evt.latencyMs ?? null, evt.queueWaitMs ?? null,
-        null, null, evt.unitsDelta ?? null, evt.causedByEventId ?? null, eventJson, eventSha256
-      )
-      .run();
-
-    if (result.meta.changes === 0) {
-      // Dedupe hit: a previous delivery already wrote this key. Return its
-      // id so a follow-on causedByEventId points at the row that exists.
-      const existing = await db
-        .prepare('SELECT event_id FROM events WHERE dedupe_key = ?1')
-        .bind(evt.dedupeKey)
-        .first<{ event_id: string }>();
-      return existing?.event_id ?? null;
-    }
-    return eventId;
+    return await insertEvent(db, env, evt);
   } catch (err) {
     log('warn', 'ledger write failed', {
       eventName: evt.eventName,
@@ -240,4 +254,17 @@ export async function recordEvent(
     });
     return null;
   }
+}
+
+/**
+ * Strict companion to recordEvent, for a row that is the proof of a debt
+ * (the dead-letter alarm). Throws when EVENTS_DB is unbound, the insert
+ * fails, or no row holds the dedupe key afterwards. Returns the event_id.
+ */
+export async function recordEventOrThrow(env: Env, evt: LedgerEvent): Promise<string> {
+  const db = env.EVENTS_DB as D1Database | undefined;
+  if (!db) throw new Error('EVENTS_DB binding is undefined on this deploy');
+  const id = await insertEvent(db, env, evt);
+  if (!id) throw new Error('insert ignored and no row holds the dedupe key');
+  return id;
 }

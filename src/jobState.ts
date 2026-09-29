@@ -16,6 +16,11 @@ import type { Env, JobState } from './types';
 
 export const JOB_TTL_S = 60 * 60; // 1h: long enough that a refresh recovers; short enough to bound storage.
 
+/** A record that carries an unpaid refund (`refundDue`, `refundOwed`) must
+ *  outlive the one-hour record so the sweep can still find it
+ *  (n1-ledger-02.md 002 rulings A and B). */
+export const DEBT_TTL_S = 24 * 60 * 60;
+
 /** R2 allows about one write per second per key and answers a faster write
  *  with error 10058 ("Reduce your concurrent request rate for the same
  *  object"). The taskId persist lands about 150 ms after `running`, so
@@ -67,10 +72,16 @@ async function putJobStateR2(env: Env, jobId: string, body: string, log: Logger)
  * byte for byte the same JSON. Unconditional: callers that must not overwrite
  * a terminal state go through writeStateUnlessTerminal below.
  */
-export async function putJobState(env: Env, jobId: string, state: JobState, log: Logger): Promise<void> {
+export async function putJobState(
+  env: Env,
+  jobId: string,
+  state: JobState,
+  log: Logger,
+  ttlS: number = JOB_TTL_S
+): Promise<void> {
   const body = JSON.stringify(state);
   await putJobStateR2(env, jobId, body, log);
-  await env.SPRITEBREW_KV.put(`job:${jobId}`, body, { expirationTtl: JOB_TTL_S });
+  await env.SPRITEBREW_KV.put(`job:${jobId}`, body, { expirationTtl: ttlS });
 }
 
 /**
@@ -81,14 +92,15 @@ export async function putJobState(env: Env, jobId: string, state: JobState, log:
  * slower invocation cannot then clobber a terminal state a faster concurrent
  * redelivery already committed. Route every non-initial state write through
  * this: taskId-persist after submit, recordSuccess, recordFailure, and the
- * dead-letter handler.
+ * dead-letter handler. Returns whether it wrote.
  */
 export async function writeStateUnlessTerminal(
   env: Env,
   stateKey: string,
   nextState: JobState,
-  log: Logger
-): Promise<void> {
+  log: Logger,
+  ttlS: number = JOB_TTL_S
+): Promise<boolean> {
   const raw = await env.SPRITEBREW_KV.get(stateKey);
   const cur = raw ? (JSON.parse(raw) as JobState) : null;
   if (cur?.status === 'success' || cur?.status === 'error') {
@@ -96,11 +108,12 @@ export async function writeStateUnlessTerminal(
       currentStatus: cur.status,
       attemptedStatus: nextState.status,
     });
-    return;
+    return false;
   }
   // Every caller builds stateKey as `job:{jobId}` (the sweep through
   // SWEEP_KEY_PREFIX); putJobState rebuilds it from the jobId.
-  await putJobState(env, stateKey.slice('job:'.length), nextState, log);
+  await putJobState(env, stateKey.slice('job:'.length), nextState, log, ttlS);
+  return true;
 }
 
 /**

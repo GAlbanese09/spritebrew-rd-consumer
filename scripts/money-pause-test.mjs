@@ -26,14 +26,18 @@ const worker = (await import(pathToFileURL(path.join(OUT, 'index.mjs')).href)).d
 
 // ── Stubs ──
 
-let calls, kv, r2, events, control, controlThrows, fetchStatus;
+let calls, kv, kvTtl, kvFailPut, r2, events, eventsThrow, control, controlThrows, fetchStatus;
 function reset() {
-  calls = []; kv = new Map(); r2 = new Map(); events = [];
+  calls = []; kv = new Map(); kvTtl = new Map(); kvFailPut = () => false; r2 = new Map(); events = []; eventsThrow = false;
   control = { money_pause: '0' }; controlThrows = false; fetchStatus = 404;
 }
 const kvStub = {
   get: async (k) => { calls.push(`kv.get ${k}`); return kv.get(k) ?? null; },
-  put: async (k, v) => { calls.push(`kv.put ${k}`); kv.set(k, v); },
+  put: async (k, v, opts) => {
+    calls.push(`kv.put ${k}`);
+    if (kvFailPut(k)) throw new Error('stub: KV put failed');
+    kv.set(k, v); kvTtl.set(k, opts?.expirationTtl);
+  },
   delete: async (k) => { kv.delete(k); },
   list: async ({ prefix, cursor } = {}) => {
     calls.push(`kv.list ${prefix}`);
@@ -50,6 +54,7 @@ const eventsStub = {
     const stmt = { args: [] };
     stmt.bind = (...a) => { stmt.args = a; return stmt; };
     stmt.run = async () => {
+      if (eventsThrow) throw new Error('stub: D1 insert failed');
       const json = stmt.args.find((a) => typeof a === 'string' && a.startsWith('{') && a.includes('"eventName"'));
       if (json) events.push(JSON.parse(json));
       return { meta: { changes: 1 } };
@@ -75,8 +80,8 @@ const ledgerStub = {
     },
   }),
 };
-const makeEnv = ({ ledger = true } = {}) => ({
-  SPRITEBREW_KV: kvStub, GALLERY_BUCKET: r2Stub, EVENTS_DB: eventsStub,
+const makeEnv = ({ ledger = true, eventsDb = true } = {}) => ({
+  SPRITEBREW_KV: kvStub, GALLERY_BUCKET: r2Stub, ...(eventsDb ? { EVENTS_DB: eventsStub } : {}),
   ...(ledger ? { LEDGER_DB: ledgerStub } : {}),
   APP_ENV: 'dev', RETRO_DIFFUSION_API_KEY: 'placeholder',
 });
@@ -202,7 +207,7 @@ check('0f: a later delivery -> acked, no second refund', m.outcome?.ack && balan
 // ── The sweep ──
 
 reset(); control.money_pause = '1'; seed(USER, 100);
-kv.set('job:job_sweep', running({ startedAt: Date.now() - 30 * 60_000, refundDue: { errorCode: 'rd_http_500', at: Date.now() } }));
+kv.set('job:job_sweep', running({ startedAt: Date.now() - 30 * 60_000, refundDue: { errorCode: 'rd_http_500', at: Date.now() - 25 * 60_000 } }));
 await worker.scheduled({}, makeEnv(), {});
 check('sweep while paused -> skipped (no job listing, no refund)', !calls.includes('kv.list job:') && balance() === 100);
 control.money_pause = '0'; calls = [];
@@ -243,6 +248,118 @@ check('A: the status record says refunded (KV and R2)', recA?.status === 'error'
 m = message('job_A', 5); await dlq(m);
 check('A: another delivery -> acked, no second refund', m.outcome?.ack && balance() === 100 + COST);
 check('A: no generation.unrefunded alarm', !events.some((e) => e.eventName === 'generation.unrefunded'));
+
+
+// ── n1-ledger-02.md 002 ruling A: the last paused dead letter keeps its debt ──
+
+// Drive one job to its last dead-letter delivery while paused, with the alarm
+// write failing the given way; return the attempt-6 outcome.
+async function lastPausedDelivery(jobId, env) {
+  control.money_pause = '1';
+  kv.set(`job:${jobId}`, JSON.stringify({ status: 'pending', userId: USER, mode: 'create', enqueuedAt: Date.now() - 60_000 }));
+  const m6 = message(jobId, 6);
+  await dlq(m6, env);
+  return m6;
+}
+const age = (jobId, minutes) => {
+  const r = record(jobId);
+  if (r?.refundDue) { r.refundDue.at = Date.now() - minutes * 60_000; kv.set(`job:${jobId}`, JSON.stringify(r)); }
+};
+
+for (const [label, setup, env] of [
+  ['EVENTS_DB absent', () => {}, () => makeEnv({ eventsDb: false })],
+  ['the alarm insert throws', () => { eventsThrow = true; }, () => makeEnv()],
+  ["dev fault 'events_db_absent'", () => { control.dev_fault = 'events_db_absent'; }, () => makeEnv()],
+]) {
+  reset(); seed(USER, 100); setup();
+  const jobId = `job_A1_${label.replace(/\W+/g, '_')}`;
+  logs.length = 0;
+  const m6 = await lastPausedDelivery(jobId, env());
+  const owed = record(jobId);
+  check(`A.2 ${label}: attempt 6 not acked`, m6.outcome?.retry === true && !m6.outcome?.ack);
+  check(`A.2 ${label}: no alarm row, no refund`, !events.some((e) => e.eventName === 'generation.unrefunded') && balance() === 100);
+  check(`A.2 ${label}: refundDue record written, code dead_lettered, 24 h TTL`,
+    owed?.status === 'running' && owed.refundDue?.errorCode === 'dead_lettered' && owed.tokenCost === COST && kvTtl.get(`job:${jobId}`) === 86400);
+  check(`A.2 ${label}: the R2 mirror holds the same debt`, JSON.parse(r2.get(`jobs/${jobId}.json`) ?? 'null')?.refundDue?.errorCode === 'dead_lettered');
+  // After the unpause: a sweep inside 20 minutes leaves it, one past it refunds once, a second does nothing.
+  control.money_pause = '0'; eventsThrow = false; delete control.dev_fault;
+  await worker.scheduled({}, makeEnv(), {});
+  check(`A.3 ${label}: sweep leaves a debt younger than 20 min`, balance() === 100 && record(jobId)?.status === 'running');
+  age(jobId, 21);
+  await worker.scheduled({}, makeEnv(), {});
+  await worker.scheduled({}, makeEnv(), {});
+  const done = record(jobId);
+  check(`A.3 ${label}: the sweep refunds exactly once after the unpause`,
+    balance() === 100 + COST && done?.status === 'error' && done.errorCode === 'dead_lettered' && done.refunded === true);
+}
+
+// The alarm insert throws and the refund-due write fails too: the message stays unacked, the loss is logged.
+reset(); seed(USER, 100); eventsThrow = true; kvFailPut = (k) => k.startsWith('job:');
+logs.length = 0;
+m = await lastPausedDelivery('job_A1_both', makeEnv());
+check('A.2 insert throws and the refund-due write throws: not acked', m.outcome?.retry === true && !m.outcome?.ack);
+check('A.2 both fail: error line with the job, user, cost and reason',
+  logs.some((l) => l.includes('dead letter lost unsettled') && l.includes('job_A1_both') && l.includes(USER) && l.includes('"tokenCost":5') && l.includes('"reason":"paused"')));
+check('A.2 both fail: no refund', balance() === 100);
+
+// The alarm lands: acked as before, no record written.
+reset(); seed(USER, 100);
+m = await lastPausedDelivery('job_A1_ok', makeEnv());
+check('A.2 alarm row lands -> acked, no refund-due record', m.outcome?.ack === true && !record('job_A1_ok')?.refundDue
+  && events.some((e) => e.eventName === 'generation.unrefunded' && e.extra?.reason === 'paused'));
+
+// 0f settles a kept debt if the main queue ever delivers again; the sweep then leaves it.
+reset(); seed(USER, 100); eventsThrow = true;
+await lastPausedDelivery('job_A1_0f', makeEnv());
+control.money_pause = '0'; eventsThrow = false;
+m = message('job_A1_0f', 2);
+await deliver(m);
+check('A.3 0f settles the kept debt once, no RD call', m.outcome?.ack === true && balance() === 100 + COST && rdCalls().length === 0);
+await worker.scheduled({}, makeEnv(), {});
+check('A.3 then the sweep does nothing more', balance() === 100 + COST);
+
+// ── Rulings B and C: a refund the Pages enqueue catch owes ──
+
+const REQ = 'gen:user_X:1:abc';
+const owedRecord = (over = {}) => JSON.stringify({ status: 'error', userId: USER, mode: 'create', enqueuedAt: Date.now() - 30 * 60_000,
+  failedAt: Date.now() - 25 * 60_000, error: 'Could not start your generation.', errorCode: 'submission_failed', attempts: 0, refunded: false,
+  refundOwed: { tokenCost: COST, reason: 'refund_credit_failed', requestId: REQ, idempotencyKey: `refund:${REQ}`, balanceWritten: false }, ...over });
+
+reset(); seed(USER, 100); kv.set('job:job_B', owedRecord());
+await worker.scheduled({}, makeEnv(), {});
+let rb = record('job_B');
+check('B.3 sweep refunds a refundOwed record once', balance() === 100 + COST);
+check('B.3 the record is rewritten refunded true, refundOwed removed, refundSettled kept',
+  rb?.status === 'error' && rb.refunded === true && !rb.refundOwed && rb.refundSettled?.evidence === 'refunded_by_sweep');
+await worker.scheduled({}, makeEnv(), {});
+check('B.3 a second sweep credits nothing', balance() === 100 + COST);
+
+reset(); seed(USER, 100); kv.set('job:job_B_young', owedRecord({ failedAt: Date.now() - 5 * 60_000 }));
+await worker.scheduled({}, makeEnv(), {});
+check('B.3 a refundOwed record younger than 20 min is left alone', balance() === 100 && record('job_B_young')?.refundOwed);
+
+reset(); seed(USER, 100); control.money_pause = '1'; kv.set('job:job_B_paused', owedRecord());
+await worker.scheduled({}, makeEnv(), {});
+check('B.3 nothing is settled while paused', balance() === 100 && record('job_B_paused')?.refundOwed);
+
+// C: Pages' credit already moved the balance (C.4's state): no second credit.
+reset(); seed(USER, 100);
+kv.set('job:job_C', owedRecord({ refundOwed: { tokenCost: COST, reason: 'refund_credit_failed', requestId: REQ, idempotencyKey: `refund:${REQ}`, balanceWritten: true } }));
+await worker.scheduled({}, makeEnv(), {});
+rb = record('job_C');
+check('C.4 balanceWritten true -> the sweep does not credit again', balance() === 100);
+check('C.4 the record is settled refunded true from that evidence', rb?.refunded === true && !rb.refundOwed && rb.refundSettled?.evidence === 'balance_written_at_failure');
+
+reset(); seed(USER, 100); kv.set(`token_idempotency:refund:${REQ}`, '1'); kv.set('job:job_C_key', owedRecord());
+await worker.scheduled({}, makeEnv(), {});
+check('C.2 the Pages refund key present -> no credit, settled', balance() === 100 && record('job_C_key')?.refundSettled?.evidence === 'pages_refund_key_present');
+
+reset(); seed(USER, 100); kv.set('job:job_C_kvdown', owedRecord()); kvFailPut = (k) => k.startsWith('token_balance:');
+await worker.scheduled({}, makeEnv(), {});
+check('B.3 KV still failing -> nothing settled, record kept for the next run', balance() === 100 && record('job_C_kvdown')?.refundOwed);
+kvFailPut = () => false;
+await worker.scheduled({}, makeEnv(), {});
+check('B.3 once KV recovers -> refunded once', balance() === 100 + COST && record('job_C_kvdown')?.refunded === true);
 
 out(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
