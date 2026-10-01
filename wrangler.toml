@@ -64,6 +64,16 @@ database_name = "spritebrew-events"
 database_id = "fb33d2dc-cfdc-4ed3-9311-12abaf951816"
 migrations_dir = "migrations"
 
+# Money ledger (n1-ledger.md 005). Release 1 reads only its control table:
+# the money pause. The readers fail closed, so this binding and the
+# money_pause = '0' row must exist before a release 1 deploy.
+# Migrations in ./migrations-ledger.
+[[env.production.d1_databases]]
+binding = "LEDGER_DB"
+database_name = "spritebrew-ledger"
+database_id = "4d433421-a669-4fc0-909c-993f6d6cd15b"
+migrations_dir = "migrations-ledger"
+
 # Observability: enabled in the dashboard 2026-09-18 after the discovery that
 # every log('warn') the consumer writes about an RD failure or a rescue was
 # being discarded. Declared here so a deploy cannot silently switch it back
