@@ -167,9 +167,10 @@ export interface JobStateError {
   /**
    * Written by the Pages enqueue catch when its compensating refund could not
    * be confirmed (n1-ledger-02.md 002 rulings B and C). The stale-running
-   * sweep settles it from evidence: no credit when `balanceWritten` is true or
-   * the Pages refund key exists, else one refund keyed on the job. Removed,
-   * with `refunded: true` and `refundSettled`, once settled.
+   * sweep or the dead-letter handler settles it from evidence
+   * (src/refundOwed.ts): no credit when `balanceWritten` is true or the Pages
+   * refund key exists, else one refund keyed on the job. Removed, with
+   * `refunded: true` and `refundSettled`, from both copies once settled.
    */
   refundOwed?: {
     tokenCost: number;
@@ -180,7 +181,8 @@ export interface JobStateError {
     /** creditTokens finished its balance write before failing: the tokens already moved. */
     balanceWritten: boolean;
   };
-  refundSettled?: { by: 'sweep'; at: number; evidence: string };
+  /** Who settled `refundOwed` and from what evidence (n1-ledger-02.md 006 ruling A). */
+  refundSettled?: { by: 'sweep' | 'dead_letter'; at: number; evidence: string };
 }
 
 export type JobState =

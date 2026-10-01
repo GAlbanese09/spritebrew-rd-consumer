@@ -77,6 +77,7 @@ import { putJobState, writeStateUnlessTerminal } from './jobState';
 import { runDigestIfDue } from './digest';
 import { DEAD_LETTER_QUEUES, handleDeadLetter } from './deadLetter';
 import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
+import { settleRefundOwed } from './refundOwed';
 
 const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
@@ -1286,7 +1287,16 @@ async function sweepStaleRunning(env: Env): Promise<void> {
       if (st.status === 'error' && st.refundOwed && st.refunded !== true) {
         const owedAgeMs = now - st.failedAt;
         if (owedAgeMs <= SWEEP_STALE_AFTER_MS) continue;
-        await settleRefundOwed(env, jobId, st, owedAgeMs, log);
+        try {
+          const settled = await settleRefundOwed(env, jobId, st, 'sweep', log);
+          log('info', 'refund owed by Pages settled', {
+            jobId, userId: st.userId, evidence: settled.evidence, ageMs: owedAgeMs, newBalance: settled.newBalance,
+          });
+        } catch (err) {
+          log('error', 'refund owed by Pages not settled; leaving for next run', {
+            jobId, userId: st.userId, ageMs: owedAgeMs, error: errText(err),
+          });
+        }
         processed++;
         continue;
       }
@@ -1397,68 +1407,6 @@ async function sweepOne(
       jobId,
       userId,
       mode,
-      ageMs,
-      error: errText(err),
-    });
-  }
-}
-
-/**
- * Settle a refund the Pages enqueue catch owes (`refundOwed`), from evidence,
- * never blind (n1-ledger-02.md 002 ruling C). No credit when Pages' credit
- * already wrote the balance (`balanceWritten`) or its refund key exists;
- * otherwise one refund through refundTokens keyed on the job, which a
- * second run finds already applied. Then the record is rewritten
- * `refunded: true` with `refundSettled`, and `refundOwed` removed so the
- * sweep does not pick it again. A failure is logged and left for the next run.
- */
-async function settleRefundOwed(
-  env: Env,
-  jobId: string,
-  state: JobStateError,
-  ageMs: number,
-  log: Logger
-): Promise<void> {
-  const owed = state.refundOwed!;
-  const { userId, mode } = state;
-  const stateKey = `${SWEEP_KEY_PREFIX}${jobId}`;
-  try {
-    let evidence: string;
-    let newBalance: number | undefined;
-    if (owed.balanceWritten) {
-      evidence = 'balance_written_at_failure';
-    } else if (await env.SPRITEBREW_KV.get(`token_idempotency:${owed.idempotencyKey}`)) {
-      evidence = 'pages_refund_key_present';
-    } else {
-      const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, owed.tokenCost, jobId, { mode });
-      evidence = refundResult.alreadyApplied ? 'job_refund_key_present' : 'refunded_by_sweep';
-      newBalance = refundResult.newBalance;
-    }
-
-    await recordEvent(env, {
-      eventName: 'generation.refunded',
-      level: 'info',
-      dedupeKey: `${jobId}:generation.refunded`,
-      userId,
-      jobId,
-      requestId: owed.requestId,
-      unitsDelta: owed.tokenCost,
-      extra: { settledBy: 'sweep', evidence, reason: owed.reason, newBalance },
-    }, log);
-
-    // Re-read: rewrite only a record that still owes this refund.
-    const raw = await env.SPRITEBREW_KV.get(stateKey);
-    const cur = raw ? (JSON.parse(raw) as JobState) : null;
-    if (cur?.status === 'error' && cur.refundOwed && cur.refunded !== true) {
-      const { refundOwed: _settled, ...rest } = cur;
-      await putJobState(env, jobId, { ...rest, refunded: true, refundSettled: { by: 'sweep', at: Date.now(), evidence } }, log);
-    }
-
-    log('info', 'refund owed by Pages settled', { jobId, userId, evidence, ageMs, newBalance });
-  } catch (err) {
-    log('error', 'refund owed by Pages not settled; leaving for next run', {
-      jobId,
-      userId,
       ageMs,
       error: errText(err),
     });

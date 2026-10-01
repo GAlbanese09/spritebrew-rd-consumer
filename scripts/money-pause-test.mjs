@@ -26,9 +26,9 @@ const worker = (await import(pathToFileURL(path.join(OUT, 'index.mjs')).href)).d
 
 // ── Stubs ──
 
-let calls, kv, kvTtl, kvFailPut, r2, events, eventsThrow, control, controlThrows, fetchStatus;
+let calls, kv, kvTtl, kvFailPut, r2, r2FailPut, events, eventsThrow, control, controlThrows, fetchStatus;
 function reset() {
-  calls = []; kv = new Map(); kvTtl = new Map(); kvFailPut = () => false; r2 = new Map(); events = []; eventsThrow = false;
+  calls = []; kv = new Map(); kvTtl = new Map(); kvFailPut = () => false; r2 = new Map(); r2FailPut = () => false; events = []; eventsThrow = false;
   control = { money_pause: '0' }; controlThrows = false; fetchStatus = 404;
 }
 const kvStub = {
@@ -47,7 +47,11 @@ const kvStub = {
 const r2Stub = {
   get: async (k) => { calls.push(`r2.get ${k}`); return r2.has(k) ? { text: async () => r2.get(k) } : null; },
   head: async (k) => { calls.push(`r2.head ${k}`); return r2.has(k) ? {} : null; },
-  put: async (k, v) => { calls.push(`r2.put ${k}`); r2.set(k, v); return {}; },
+  put: async (k, v) => {
+    calls.push(`r2.put ${k}`);
+    if (r2FailPut(k)) throw new Error('stub: R2 put failed');
+    r2.set(k, v); return {};
+  },
 };
 const eventsStub = {
   prepare: (sql) => {
@@ -360,6 +364,130 @@ check('B.3 KV still failing -> nothing settled, record kept for the next run', b
 kvFailPut = () => false;
 await worker.scheduled({}, makeEnv(), {});
 check('B.3 once KV recovers -> refunded once', balance() === 100 + COST && record('job_C_kvdown')?.refunded === true);
+
+
+// ── n1-ledger-02.md 006: the dead-letter handler settles a refund Pages owes ──
+
+const PAGES_KEY = `token_idempotency:refund:${REQ}`;
+const consumerKey = (jobId) => kv.has(`token_idempotency:refund:${jobId}`);
+const r2rec = (jobId) => { const r = r2.get(`jobs/${jobId}.json`); return r ? JSON.parse(r) : null; };
+const owingRecord = ({ minutesAgo = 41, balanceWritten = false } = {}) => owedRecord({
+  failedAt: Date.now() - minutesAgo * 60_000,
+  refundOwed: { tokenCost: COST, reason: 'refund_credit_failed', requestId: REQ, idempotencyKey: `refund:${REQ}`, balanceWritten },
+});
+function seedOwing(jobId, { r2Copy = 'owing', kvCopy = 'owing', ...opts } = {}) {
+  const body = owingRecord(opts);
+  if (r2Copy === 'owing') r2.set(`jobs/${jobId}.json`, body);
+  if (r2Copy === 'pending') r2.set(`jobs/${jobId}.json`, JSON.stringify({ status: 'pending', userId: USER, mode: 'create', enqueuedAt: Date.now() - 45 * 60_000 }));
+  if (kvCopy === 'owing') kv.set(`job:${jobId}`, body);
+}
+// 'by:evidence' for a settled copy, 'unsettled' otherwise.
+const settled = (st) => (st?.status === 'error' && st.refunded === true && !st.refundOwed ? `${st.refundSettled?.by}:${st.refundSettled?.evidence}` : 'unsettled');
+const bothCopies = (jobId, want) => settled(record(jobId)) === want && settled(r2rec(jobId)) === want;
+
+const CASES = [
+  ['DL1', { balanceWritten: true }, 100, false, 'balance_written_at_failure'],
+  ['DL2', { pagesKey: true }, 100, false, 'pages_refund_key_present'],
+  ['DL3', {}, 100 + COST, true, 'refunded_by_'],
+];
+const seedCase = (jobId, c) => { seedOwing(jobId, { balanceWritten: !!c.balanceWritten }); if (c.pagesKey) kv.set(PAGES_KEY, '1'); };
+
+// DL1 to DL3: one delivery, money open, both copies owe, failed 41 min ago.
+for (const [row, c, wantBalance, wantKey, evidence] of CASES) {
+  reset(); seed(USER, 100); const jobId = `job_${row}`; seedCase(jobId, c);
+  m = message(jobId, 1); await dlq(m);
+  const ev = evidence === 'refunded_by_' ? 'refunded_by_dead_letter' : evidence;
+  check(`${row} balance ${wantBalance}, consumer key ${wantKey ? 'written' : 'not written'}`, balance() === wantBalance && consumerKey(jobId) === wantKey);
+  check(`${row} both copies refunded true, refundSettled { dead_letter, ${ev} }, no refundOwed; acked`, bothCopies(jobId, `dead_letter:${ev}`) && m.outcome?.ack === true);
+  if (row === 'DL3') {
+    m = message(jobId, 2); await dlq(m);
+    check('DL3 a second delivery of the same message: 105, acked', balance() === 100 + COST && m.outcome?.ack === true);
+  }
+}
+
+// DL4 (handler, then sweep) and DL5 (sweep, then handler); DL6 the same with
+// EVENTS_DB absent and with its insert throwing.
+for (const events_ of ['present', 'absent', 'throws']) {
+  for (const order of ['handler_then_sweep', 'sweep_then_handler']) {
+    const row = events_ === 'present' ? (order === 'handler_then_sweep' ? 'DL4' : 'DL5') : `DL6 (${order === 'handler_then_sweep' ? 'DL4' : 'DL5'}, EVENTS_DB ${events_})`;
+    for (const [base, c, wantBalance, wantKey, evidence] of CASES) {
+      reset(); seed(USER, 100); const jobId = `job_${base}_${order}_${events_}`; seedCase(jobId, c);
+      if (events_ === 'throws') eventsThrow = true;
+      const env = () => makeEnv({ eventsDb: events_ !== 'absent' });
+      logs.length = 0;
+      m = message(jobId, 1);
+      if (order === 'handler_then_sweep') { await dlq(m, env()); await worker.scheduled({}, env(), {}); }
+      else { await worker.scheduled({}, env(), {}); await dlq(m, env()); }
+      const by = order === 'handler_then_sweep' ? 'dead_letter' : 'sweep';
+      const ev = evidence === 'refunded_by_' ? `refunded_by_${by}` : evidence;
+      check(`${row} ${base}: balance ${wantBalance}, consumer key ${wantKey ? 'written' : 'not written'}, no further credit`, balance() === wantBalance && consumerKey(jobId) === wantKey);
+      check(`${row} ${base}: both copies settled by ${by} (${ev})`, bothCopies(jobId, `${by}:${ev}`));
+      check(`${row} ${base}: the message acked${by === 'sweep' ? ' as already refunded' : ''}`, m.outcome?.ack === true
+        && (by === 'dead_letter' || logs.some((l) => l.includes('dead letter already refunded'))));
+    }
+  }
+}
+
+// DL7: the first settler's record writes (R2 jobs/ and KV job:) all throw; EVENTS_DB absent.
+for (const order of ['handler_first', 'sweep_first']) {
+  reset(); seed(USER, 100); const jobId = `job_DL7_${order}`; seedOwing(jobId);
+  const env = makeEnv({ eventsDb: false });
+  kvFailPut = (k) => k.startsWith('job:'); r2FailPut = (k) => k.startsWith('jobs/');
+  const m1 = message(jobId, 1);
+  if (order === 'handler_first') await dlq(m1, env); else await worker.scheduled({}, env, {});
+  const afterFirst = balance(); const keyAfterFirst = consumerKey(jobId);
+  const stillOwes = settled(record(jobId)) === 'unsettled' && settled(r2rec(jobId)) === 'unsettled';
+  kvFailPut = () => false; r2FailPut = () => false;
+  const m2 = message(jobId, 1);
+  if (order === 'handler_first') await worker.scheduled({}, env, {}); else await dlq(m2, env);
+  const second = order === 'handler_first' ? 'sweep' : 'dead_letter';
+  check(`DL7 ${order}: the first settler credits once, its rewrite fails, both copies still owe${order === 'handler_first' ? ', message retried' : ''}`,
+    afterFirst === 100 + COST && keyAfterFirst && stillOwes && (order === 'sweep_first' || (m1.outcome?.retry === true && !m1.outcome?.ack)));
+  check(`DL7 ${order}: exactly one credit in total`, balance() === 100 + COST);
+  check(`DL7 ${order}: the ${second} finds the consumer key and settles both copies${order === 'sweep_first' ? ', acked' : ''}`,
+    bothCopies(jobId, `${second}:job_refund_key_present`) && (order === 'handler_first' || m2.outcome?.ack === true));
+}
+
+// DL8 (young) and DL9 (young, last delivery).
+reset(); seed(USER, 100); seedOwing('job_DL8', { minutesAgo: 1, balanceWritten: true });
+let before = [kv.get('job:job_DL8'), r2.get('jobs/job_DL8.json')];
+m = message('job_DL8', 2); await dlq(m);
+check('DL8 young: retried with delay 2,340 s (plus or minus 1), not acked', m.outcome?.retry === true && Math.abs(m.outcome.delaySeconds - 2340) <= 1 && !m.outcome?.ack);
+check('DL8 young: balance 100, no consumer key, both copies unchanged', balance() === 100 && !consumerKey('job_DL8')
+  && kv.get('job:job_DL8') === before[0] && r2.get('jobs/job_DL8.json') === before[1]);
+
+reset(); seed(USER, 100); seedOwing('job_DL9', { minutesAgo: 1, balanceWritten: true });
+m = message('job_DL9', 6); await dlq(m);
+check('DL9 young at the last delivery: settled now, balance 100, no consumer key, acked', balance() === 100 && !consumerKey('job_DL9')
+  && bothCopies('job_DL9', 'dead_letter:balance_written_at_failure') && m.outcome?.ack === true);
+
+// DL10: the copies differ.
+reset(); seed(USER, 100); seedOwing('job_DL10a', { r2Copy: 'pending', balanceWritten: true });
+m = message('job_DL10a', 1); await dlq(m);
+check('DL10 R2 pending, KV owes (balanceWritten): balance 100, no consumer key, both copies settled, acked', balance() === 100 && !consumerKey('job_DL10a')
+  && bothCopies('job_DL10a', 'dead_letter:balance_written_at_failure') && m.outcome?.ack === true);
+reset(); seed(USER, 100); seedOwing('job_DL10b', { kvCopy: 'none' });
+m = message('job_DL10b', 1); await dlq(m);
+check('DL10 R2 owes (no evidence), no KV copy: balance 105, consumer key, both copies settled, acked', balance() === 100 + COST && consumerKey('job_DL10b')
+  && bothCopies('job_DL10b', 'dead_letter:refunded_by_dead_letter') && m.outcome?.ack === true);
+
+// DL11: paused.
+reset(); seed(USER, 100); seedOwing('job_DL11', { balanceWritten: true }); control.money_pause = '1';
+before = [kv.get('job:job_DL11'), r2.get('jobs/job_DL11.json')];
+m = message('job_DL11', 2); await dlq(m);
+check('DL11 paused: held at the paused delay (900 s), no credit, no consumer key, copies unchanged', m.outcome?.retry === true && m.outcome.delaySeconds === 900
+  && balance() === 100 && !consumerKey('job_DL11') && kv.get('job:job_DL11') === before[0] && r2.get('jobs/job_DL11.json') === before[1]);
+eventsThrow = true; logs.length = 0;
+m = message('job_DL11', 6); await dlq(m);
+check('DL11 paused, last delivery, alarm insert throws: no refundDue write (both copies unchanged), final retry',
+  kv.get('job:job_DL11') === before[0] && r2.get('jobs/job_DL11.json') === before[1] && m.outcome?.retry === true && m.outcome.delaySeconds === undefined && !m.outcome?.ack);
+check('DL11 the warn line names both copies; no "lost unsettled" line',
+  logs.some((l) => l.includes('the debt stays in the record that owes it') && l.includes('"copies":["r2","kv"]'))
+  && !logs.some((l) => l.includes('dead letter lost unsettled')));
+control.money_pause = '0'; eventsThrow = false;
+await worker.scheduled({}, makeEnv(), {});
+check('DL11 after the unpause the sweep settles it, no credit', balance() === 100 && !consumerKey('job_DL11')
+  && bothCopies('job_DL11', 'sweep:balance_written_at_failure'));
 
 out(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

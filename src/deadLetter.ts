@@ -12,27 +12,37 @@
 //      ack, no refund.
 //   3. Already refunded? A D1 generation.refunded row, or an error record
 //      with refunded: true. Ack.
-//   4. A running record younger than 40 minutes may be a live duplicate
+//   4. Older than six days: alarm, never refund. Ack.
+//   5. A refund the Pages enqueue catch owes (`refundOwed` on the copy
+//      readJobState returned, or on the KV copy when that came from R2):
+//      younger than 40 minutes from its failedAt, retry for the remainder so
+//      the sweep settles it first, except at the last delivery. Then step 7,
+//      and with money open src/refundOwed.ts settles it from evidence and the
+//      message is acked. Never step 8 (n1-ledger-02.md 006 ruling C).
+//   6. A running record younger than 40 minutes may be a live duplicate
 //      delivery still working, or one the sweep is about to refund: retry the
 //      message once that age is reached.
-//   5. Money paused (n1-ledger 008 ruling A): no refund and no ack. Retry
+//   7. Money paused (n1-ledger 008 ruling A): no refund and no ack. Retry
 //      every 900 s. The last paused delivery acks only once the alarm row
 //      (reason 'paused') is proven written. If it is not, the debt goes into
 //      the job record as `refundDue` with a 24-hour TTL, which the sweep
 //      settles after the unpause; if that write fails too, the loss is
-//      logged at error level (n1-ledger-02.md 002 ruling A).
-//   6. Refund, then the D1 rows, then the terminal record, in recordFailure's
+//      logged at error level (n1-ledger-02.md 002 ruling A). A record that
+//      owes a Pages refund already is the kept debt: no refund-due record
+//      over it, one warn line naming the copies that hold it.
+//   8. Refund, then the D1 rows, then the terminal record, in recordFailure's
 //      order, the record through writeStateUnlessTerminal.
 //
 // A throw retries through the queue (max_retries 5, retry_delay 60 s, no DLQ
 // of its own). The last delivery writes an alarm instead of vanishing: an
 // error log and a D1 generation.unrefunded row, which the digest lists.
 
-import type { Env, JobMessage, JobMode, JobStateError, JobStateRunning } from './types';
+import type { Env, JobMessage, JobMode, JobState, JobStateError, JobStateRunning } from './types';
 import { refundTokens } from './refund';
 import { recordEvent, recordEventOrThrow, stageForErrorCode } from './events';
 import { DEBT_TTL_S, readJobState, writeStateUnlessTerminal } from './jobState';
 import { devFaults, isMoneyPaused, pausedRetryDelayS } from './moneyPause';
+import { owesPagesRefund, settleRefundOwed } from './refundOwed';
 
 /** Exact names, per environment. No prefix match: a future queue whose name
  *  starts the same way must never be refunded by accident. */
@@ -246,7 +256,36 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
       return;
     }
 
-    if (record?.state.status === 'running') {
+    // A refund the Pages enqueue catch owes (n1-ledger-02.md 006 ruling C):
+    // on the copy readJobState returned, or on the KV copy when that came
+    // from R2 (as deliveredBy checks KV for a success). Settled from the
+    // same evidence as the sweep, never through the ordinary refund below.
+    let kvCopy: JobState | null = record?.source === 'kv' ? record.state : null;
+    if (record?.source === 'r2') {
+      const raw = await env.SPRITEBREW_KV.get(`job:${f.jobId}`);
+      kvCopy = raw ? (JSON.parse(raw) as JobState) : null;
+    }
+    const owing: JobStateError | null = owesPagesRefund(record?.state)
+      ? record!.state as JobStateError
+      : owesPagesRefund(kvCopy) ? kvCopy : null;
+    const owingCopies = [
+      ...(record?.source === 'r2' && owesPagesRefund(record.state) ? ['r2'] : []),
+      ...(owesPagesRefund(kvCopy) ? ['kv'] : []),
+    ];
+    if (owing && attempt < DLQ_LAST_ATTEMPT) {
+      // The sweep (20 minutes plus one 15-minute cron) settles any KV-visible
+      // record first; then this handler finds it refunded and acks. At the
+      // last delivery a retry deletes the message, so it settles now.
+      const ageMs = Number.isFinite(owing.failedAt) ? now - owing.failedAt : RUNNING_GRACE_MS;
+      if (ageMs < RUNNING_GRACE_MS) {
+        const delaySeconds = Math.min(2400, Math.max(1, Math.ceil((RUNNING_GRACE_MS - ageMs) / 1000)));
+        log('info', 'refund owed by Pages, younger than 40 min; retrying later, no credit', { ageMs, delaySeconds });
+        msg.retry({ delaySeconds });
+        return;
+      }
+    }
+
+    if (!owing && record?.state.status === 'running') {
       const ageMs = Date.now() - record.state.startedAt;
       if (ageMs < RUNNING_GRACE_MS) {
         const delaySeconds = Math.ceil((RUNNING_GRACE_MS - ageMs) / 1000);
@@ -267,6 +306,16 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
       if (attempt >= DLQ_LAST_ATTEMPT) {
         if (await alarm(env, msg, 'paused', f, log, 'money paused through the last dead-letter delivery')) {
           msg.ack();
+          return;
+        }
+        if (owing) {
+          // The owing record already is the kept debt: no refund-due record
+          // over it. The sweep settles it after the unpause.
+          log('warn', 'alarm row not written; the debt stays in the record that owes it, for the sweep', {
+            copies: owingCopies,
+            tokenCost: owing.refundOwed?.tokenCost,
+          });
+          msg.retry();
           return;
         }
         const now = Date.now();
@@ -313,6 +362,19 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
       const delaySeconds = await pausedRetryDelayS(env);
       log('warn', 'money paused; dead letter held, no refund', { delaySeconds });
       msg.retry({ delaySeconds });
+      return;
+    }
+
+    // A refund Pages owes: settled from evidence, then acked. A failure
+    // reaches the catch below, and the debt stays in the record for the sweep.
+    if (owing) {
+      const settled = await settleRefundOwed(env, f.jobId, owing, 'dead_letter', log);
+      log('info', 'refund owed by Pages settled', {
+        evidence: settled.evidence,
+        newBalance: settled.newBalance,
+        copies: owingCopies,
+      });
+      msg.ack();
       return;
     }
 
