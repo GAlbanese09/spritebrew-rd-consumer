@@ -11,7 +11,7 @@
 //   2. Delivered? Strong stores first, then the permanent ones. Any positive:
 //      ack, no refund.
 //   3. Already refunded? A D1 generation.refunded row, or an error record
-//      with refunded: true. Ack.
+//      with refunded: true on either copy. Ack.
 //   4. Older than six days: alarm, never refund. Ack.
 //   5. A refund the Pages enqueue catch owes (`refundOwed` on the copy
 //      readJobState returned, or on the KV copy when that came from R2):
@@ -236,9 +236,23 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
       return;
     }
 
+    // The KV copy: the returned copy when readJobState answered from KV, else
+    // read here (as deliveredBy checks KV for a success). A failed read throws
+    // to the catch. Used for the refund check below and the owing branch.
+    let kvCopy: JobState | null = record?.source === 'kv' ? record.state : null;
+    if (record?.source === 'r2') {
+      const raw = await env.SPRITEBREW_KV.get(`job:${f.jobId}`);
+      kvCopy = raw ? (JSON.parse(raw) as JobState) : null;
+    }
+
+    // A refund recorded on either copy counts (n1-ledger-02.md 009): R2 can
+    // still say pending when only the KV write landed.
     const refundedRecord = record?.state.status === 'error' && record.state.refunded === true;
-    if (refundedRecord || (await d1HasRow(env, f.jobId, ['generation.refunded']))) {
-      log('info', 'dead letter already refunded', { by: refundedRecord ? `${record?.source}_record` : 'd1_row' });
+    const refundedKv = kvCopy?.status === 'error' && kvCopy.refunded === true;
+    if (refundedRecord || refundedKv || (await d1HasRow(env, f.jobId, ['generation.refunded']))) {
+      log('info', 'dead letter already refunded', {
+        by: refundedRecord ? `${record?.source}_record` : refundedKv ? 'kv_record' : 'd1_row',
+      });
       msg.ack();
       return;
     }
@@ -258,13 +272,8 @@ export async function handleDeadLetter(msg: Message<JobMessage>, env: Env): Prom
 
     // A refund the Pages enqueue catch owes (n1-ledger-02.md 006 ruling C):
     // on the copy readJobState returned, or on the KV copy when that came
-    // from R2 (as deliveredBy checks KV for a success). Settled from the
-    // same evidence as the sweep, never through the ordinary refund below.
-    let kvCopy: JobState | null = record?.source === 'kv' ? record.state : null;
-    if (record?.source === 'r2') {
-      const raw = await env.SPRITEBREW_KV.get(`job:${f.jobId}`);
-      kvCopy = raw ? (JSON.parse(raw) as JobState) : null;
-    }
+    // from R2 (the KV copy read above). Settled from the same evidence as
+    // the sweep, never through the ordinary refund below.
     const owing: JobStateError | null = owesPagesRefund(record?.state)
       ? record!.state as JobStateError
       : owesPagesRefund(kvCopy) ? kvCopy : null;

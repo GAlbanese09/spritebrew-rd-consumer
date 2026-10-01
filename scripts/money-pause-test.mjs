@@ -489,5 +489,26 @@ await worker.scheduled({}, makeEnv(), {});
 check('DL11 after the unpause the sweep settles it, no credit', balance() === 100 && !consumerKey('job_DL11')
   && bothCopies('job_DL11', 'sweep:balance_written_at_failure'));
 
+
+// ── n1-ledger-02.md 009: a refund recorded on either copy counts ──
+
+const pendingR2 = (jobId) => r2.set(`jobs/${jobId}.json`, JSON.stringify({ status: 'pending', userId: USER, mode: 'create', enqueuedAt: Date.now() - 45 * 60_000 }));
+const kvError = (jobId, over) => kv.set(`job:${jobId}`, JSON.stringify({ status: 'error', userId: USER, mode: 'create', enqueuedAt: Date.now() - 45 * 60_000,
+  failedAt: Date.now() - 41 * 60_000, error: 'Could not start your generation.', errorCode: 'submission_failed', attempts: 0, ...over }));
+for (const [row, over, wantBalance, wantKey, wantLog] of [
+  ['DL12a', { refunded: true, refundSettled: { by: 'sweep', at: Date.now(), evidence: 'balance_written_at_failure' } }, 100, false, true],
+  ['DL12b', { refunded: true }, 100, false, true],
+  ['DL12c', { refunded: false }, 100 + COST, true, false],
+]) {
+  reset(); seed(USER, 100); const jobId = `job_${row}`;
+  pendingR2(jobId); kvError(jobId, over);
+  logs.length = 0;
+  m = message(jobId, 1); await dlq(m, makeEnv({ eventsDb: false }));
+  check(`${row} balance ${wantBalance}, consumer key ${wantKey ? 'written' : 'not written'}, acked`,
+    balance() === wantBalance && consumerKey(jobId) === wantKey && m.outcome?.ack === true);
+  check(`${row} ${wantLog ? 'logged already refunded by kv_record' : 'no already-refunded line (the ordinary refund ran once)'}`,
+    logs.some((l) => l.includes('dead letter already refunded') && l.includes('"by":"kv_record"')) === wantLog);
+}
+
 out(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
