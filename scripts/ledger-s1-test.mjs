@@ -616,6 +616,21 @@ check('T0', "D1's limits: every library statement under 100,000 bytes with at mo
   seed('ledgertest_slost');
   const lost = ctxOf(db, { hooks: { after: once('lost') } });
   check('T0', '4.7 success committed, response lost: the read-back says succeeded', (await L.successUpdate(lost, { job: 'ledgertest_slost', claim: 'own', outcome: 'rescued' })) === 'succeeded');
+  // L4 023 ruling 1: after a thrown update, our unfinished, unreleased row is a doubt, not a loss
+  seed('ledgertest_sdoubt');
+  const sd = await L.successUpdate(devCtx(db, 'batch_throw_before:success'), { job: 'ledgertest_sdoubt', claim: 'own', outcome: 'succeeded' });
+  check('T0', '4.7 success throws before it lands, the row still ours and unfinished: a doubt (error, the caller retries), never ownership lost', sd === 'error' && job(db, 'ledgertest_sdoubt').finished_at_ms === null);
+  seed('ledgertest_sdoubto', { claim_id: 'other' });
+  check('T0', '4.7 success throws, the read shows another claim: ownership lost',
+    (await L.successUpdate(devCtx(db, 'batch_throw_before:success'), { job: 'ledgertest_sdoubto', claim: 'own', outcome: 'succeeded' })) === 'ownership_lost');
+  seed('ledgertest_sdoubtr', { released_at_ms: T });
+  check('T0', '4.7 success throws, the read shows the claim released: ownership lost',
+    (await L.successUpdate(devCtx(db, 'batch_throw_before:success'), { job: 'ledgertest_sdoubtr', claim: 'own', outcome: 'succeeded' })) === 'ownership_lost');
+  setCtl(db, 'money_pause', '1');
+  seed('ledgertest_sdoubtp');
+  check('T0', '4.7 success throws while paused, the row ours: paused',
+    (await L.successUpdate(devCtx(db, 'batch_throw_before:success'), { job: 'ledgertest_sdoubtp', claim: 'own', outcome: 'succeeded' })) === 'paused');
+  setCtl(db, 'money_pause', '0');
 }
 
 // ════════════════════════════════════════════════════════════════════════

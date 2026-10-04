@@ -763,6 +763,7 @@ for (const [name, run] of [
     && alarmsOf(w, 'no_record').some((x) => JSON.parse(x.event_json).extra?.tokenCost === 11));
   check('T29', "its status: the unresolved record (error, no_record, refunded false, unresolved), never pending, never a refund",
     s?.status === 'error' && s.errorCode === 'no_record' && s.refunded === false && s.unresolved === true && q(w.ledger, 'SELECT 1 FROM ledger WHERE job_id = ?', 'ledgertest_job_ghost').length === 0);
+  check('T29', "its copy is HQ-3's Proposal, verbatim", s?.error === 'We could not confirm what happened to this generation. It has been flagged for review.');
   setCtl(w, 'money_pause', '1');
   const r2 = await deliver(w, { ...msg, jobId: 'ledgertest_job_ghost2' });
   check('T29', 'no row while paused: retry 900 s, no tombstone', retried(r2, 900) && !job(w, 'ledgertest_job_ghost2'));

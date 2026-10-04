@@ -162,9 +162,10 @@ export function refundedRecord(r: {
   };
 }
 
-/** UNAPPROVED COPY (HQ-3): the honest unresolved record of a `no_record`
- *  tombstone (A9): never pending forever, never a claimed refund. */
-export const UNRESOLVED_COPY = 'We could not find this generation. It is under review; your tokens are safe.';
+/** UNAPPROVED COPY (HQ-3): the spec's Proposal, verbatim (`L4 023` ruling
+ *  8); HQ decides the final text before S5. The honest unresolved record of a
+ *  `no_record` tombstone (A9): never pending forever, never a claimed refund. */
+export const UNRESOLVED_COPY = 'We could not confirm what happened to this generation. It has been flagged for review.';
 
 export function unresolvedRecord(userId: string, mode: JobMode, at: number): JobStateError & { unresolved: true } {
   return {
