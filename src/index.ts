@@ -1,66 +1,32 @@
 // spritebrew-rd-consumer/src/index.ts
 //
-// Cloudflare Queues consumer for SpriteBrew RD generation jobs.
+// Cloudflare Queues consumer for SpriteBrew RD generation jobs, on the D1
+// ledger (n1-release-2-spec.md revision 9: 5.2 to 5.4, 4.6 to 4.12; S3).
+// Architectural reference: Confluence 87490562 (queue-and-poll) and 87588866
+// (inline-refund), as release 1 built them; money is now D1's.
 //
-// Architectural reference: Confluence 87490562 (queue-and-poll) + 87588866 (inline-refund).
-// Established 2026-05-07 — Session 15 continued morning.
-// July-15 rewrite: animate mode migrated to RD's async job API.
-//   Create mode stays synchronous — the sync endpoint's happy path is fast
-//   enough that async_process adds no value and risks the same billing
-//   orphan class we now guard against on animate.
+// One delivery (5.2): the job's `jobs` row is read once and decides, in order:
+//   - no row: the tombstone (guarded) and its `no_record` alarm;
+//   - held: ack, nothing run, nothing paid;
+//   - finished: ack, after the repair pass for that row;
+//   - staged, unfinished: c-finalize, then 4.9's finish (owner live: retry);
+//   - an imported debt (`refund_due_code`): the delivered checks, never RD;
+//   - a task on record: c-resume, poll first, then 4.9 or the owner's refund;
+//   - the money pause gate (release 1's place): paused, retry, nothing written;
+//   - a submit with no task: stale, the canceller's refund, never RD; else a
+//     live owner;
+//   - a live claim: a live owner (attempt 1 acks, later attempts retry);
+//   - otherwise the fresh path: the animate pre-flight, c-submit, the
+//     `running` record (no tokenCost), then the phase: `submitted` before any
+//     billable RD call, `task` before any poll, `fallback` before a rescue.
+// Success is 4.9: stage, the PNG durably, the success update, publish, the
+// strict status, the marker. Failure is 4.8 `'owner'` and its r5 branch.
+// Every money movement is one guarded D1 batch through src/ledger.ts.
 //
-// Lifecycle of one message (post July-15):
-//   0. Read job:{jobId} from KV.
-//      - Terminal (success/error)                              → ack (idempotent).
-//      - Running + taskId (any mode wired async)               → resume poll.
-//        If that state also carries a `rescue` marker, the task is a
-//        fallback's and the resumed delivery is marked as a rescue too.
-//      - Running + submitAttemptedAt + !taskId                 → orphaned submit
-//        (RD may have accepted our body but we lost the id; there is NO
-//        recovery path — GET /v1/inferences/tasks 404s per probe). Refund
-//        with errorCode 'rd_submit_orphaned_redelivery' and ack.
-//      - Legacy running (no taskId, no submitAttemptedAt, within
-//        RUNNING_TIMEOUT_MS)                                   → ack duplicate.
-//   1. Status pre-flight (animate only): GET /v1/status, reads
-//      status.animations. 'degraded' (present, not "ok") + attempt<3 →
-//      msg.retry({delaySeconds:60}). RD's own "unknown" and 'absent' (field
-//      absent, non-2xx, fetch error) fail open. At attempt≥3, proceed regardless.
-//   2. Write running state (with submitAttemptedAt for animate).
-//   3. RD call:
-//      - create   → callRd (sync, unchanged).
-//      - animate  → submitAsyncTask → persist taskId → pollAsyncTask.
-//        On primary failure of rd_advanced_animation__*: fallback via
-//        animation__any_animation clamped to 64×64 (probe C5). If fallback
-//        input isn't available and original >64px, skip fallback and let
-//        the primary error propagate.
-//        A fallback delivery is MARKED (July 16): the success record carries
-//        rescued + requested/delivered geometry so the client can say so
-//        outright instead of inferring it. WHEN a rescue happens is unchanged.
-//   4a. SUCCESS         → gallery + KV success + ack.
-//   4b. RETRYABLE FAIL  → msg.retry(), no refund yet.
-//   4c. TERMINAL FAIL   → refund + KV error + ack.
-//
-// ============================================================================
-// CONCURRENT-WRITE RISK (KNOWN, INHERITED FROM PAGES, NOT MITIGATED HERE)
-// ============================================================================
-// Cloudflare KV has no compare-and-swap. The consumer's refund-on-failure
-// performs read-modify-write on token_balance:{userId}. A concurrent Stripe
-// purchase webhook can collide on the same record. Worst case: a sub-second
-// timing window where both read pre-update balance and the slower writer
-// overwrites the faster writer's update — losing one operation.
-//
-// This race exists on the synchronous code path today (Pages-side creditTokens
-// has the same read-modify-write pattern). The consumer does not introduce
-// new risk; it slightly extends the window because the refund now runs after
-// the queue+consumer roundtrip rather than synchronously inside the producer
-// request. Acceptable inheritance for v1.
-//
-// Future fix: migrate token_balance to Durable Objects (atomic per-userId
-// instance) or D1 (transactional writes). Tracked separately. Do NOT block
-// this build on it.
-// ============================================================================
+// The cron (5.3): 4.12's sweep candidates, then the repair pass (4.11).
+// Create mode stays synchronous; animate uses RD's async job API.
 
-import type { JobMessage, JobState, JobStateRunning, JobStateSuccess, JobStateError, JobMode, Env } from './types';
+import type { JobMessage, JobMode, Env } from './types';
 import type { RdAnimateBody, RdSuccessResponse } from './rdClient';
 import {
   callRd,
@@ -70,21 +36,24 @@ import {
   probeRdStatus,
   RdError,
 } from './rdClient';
+import * as L from './ledger';
 import { refundTokens } from './refund';
-import { base64ToBytes, writeGalleryEntry } from './gallery';
-import { recordEvent, stageForErrorCode } from './events';
-import { putJobState, writeStateUnlessTerminal } from './jobState';
+import { base64ToBytes, stagePng } from './gallery';
+import { recordEvent } from './events';
 import { runDigestIfDue } from './digest';
 import { DEAD_LETTER_QUEUES, handleDeadLetter } from './deadLetter';
 import { handleMigrator } from './migrator';
 import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
-import { settleRefundOwed } from './refundOwed';
+import { putRunningBestEffort, type ArtifactMeta } from './status';
+import {
+  ACK, PAUSED_RETRY_S, PROVIDER, afterCanceller, debitContext, deliveredChecks, finishStaged, isStale, ledgerAlarm,
+  ledgerCtx, messageContext, ownerFails, publishAndRecord, successOrDoubt, readJobRow, repairOne, repairPass, retryIn,
+  tombstoneJob, type JobRow, type Next,
+} from './settle';
 
-const RUNNING_TIMEOUT_MS = 180_000;  // 3 min — if a legacy 'running' job is older than this, treat as orphaned.
 const MAX_ATTEMPTS = 3;              // matches max_retries in wrangler.toml
 const STATUS_RETRY_DELAY_S = 60;     // pre-flight backoff between attempts
 const FALLBACK_CELL_SIZE = 64;       // animation__any_animation is 64×64-locked (probe C5)
-const PROVIDER = 'retro-diffusion';  // `provider` column on every ledger row that names one
 const PROBE_SLOT_MS = 15 * 60 * 1000; // provider.status dedupe slot; matches the */15 cron
 
 type Logger = (
@@ -112,12 +81,16 @@ function errText(err: unknown): string {
 }
 
 /**
- * The half of a rescue that is known at fallback-SUBMIT time and survives a
- * crash: what the user asked for, and what we clamped to. Persisted onto the
- * running state alongside the fallback's taskId. Derived from the state type
- * so the two can't drift apart.
+ * The half of a rescue that is known at fallback-SUBMIT time: what the user
+ * asked for, and what we clamped to. Release 2 keeps the fallback phase on the
+ * `jobs` row (`phase 'fallback'`), so a resumed fallback task rebuilds this
+ * from the message, and the full descriptor rides in `artifact_meta_json`.
  */
-type RescueMarker = NonNullable<JobStateRunning['rescue']>;
+interface RescueMarker {
+  requestedWidth: number;
+  requestedHeight: number;
+  deliveredCellSize: number;
+}
 
 /**
  * Rescue descriptor for a delivery that came from the animate fallback: the
@@ -135,6 +108,9 @@ interface RescueInfo extends RescueMarker {
 interface AnimateOutcome {
   result: RdSuccessResponse;
   rescue?: RescueInfo;
+  /** The finishing poll's own start and end (`L3 007` ruling 2). */
+  pollStartedAt?: number;
+  pollEndedAt?: number;
 }
 
 // ─── PNG header parsing (delivered-geometry read) ──────────────────────────
@@ -290,15 +266,16 @@ export default {
       await handleMessage(msg, env);
     }
   },
-  // Cron: every 15 min (see wrangler.toml). Reconciles records the queue path
-  // left stuck 'running' — the create isolate-kill orphan class — by refunding
-  // and terminal-failing them out of band. Idempotent and terminal-safe.
+  // Cron: every 15 min (see wrangler.toml). 4.12's sweep settles the rows the
+  // queue path left unfinished (the create isolate-kill orphan class among
+  // them) through the guarded batches, then the repair pass (4.11) writes any
+  // status record a settlement could not.
   async scheduled(
     _controller: ScheduledController,
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
-    await sweepStaleRunning(env);
+    await sweep(env);
     // Provider status ledger row every 15 min (WD2a). Own try/catch inside;
     // cannot affect the sweep.
     await probeAndRecordProviderStatus(env);
@@ -308,12 +285,23 @@ export default {
   },
 } satisfies ExportedHandler<Env, JobMessage>;
 
+// ─── The delivery (n1-release-2-spec.md revision 9, 5.2) ───────────────────
+
+const LIVE_OWNER_RETRY_S = 30;
+
+function apply(msg: Message<JobMessage>, next: Next): void {
+  if ('ack' in next) msg.ack();
+  else if (next.retry === null) msg.retry();
+  else msg.retry({ delaySeconds: next.retry });
+}
+
+const liveOwner = (attempt: number): Next => (attempt === 1 ? ACK : retryIn(LIVE_OWNER_RETRY_S));
+
 async function handleMessage(
   msg: Message<JobMessage>,
   env: Env
 ): Promise<void> {
-  const { jobId, userId, tokenCost, mode, body } = msg.body;
-  const fallbackInputImage = msg.body.fallbackInputImage;
+  const { jobId, userId, mode, body } = msg.body;
   const attempt = msg.attempts ?? 1;
 
   const log: Logger = (level, message, extra = {}) => {
@@ -345,549 +333,302 @@ async function handleMessage(
     extra: { mode },
   }, log);
 
-  const stateKey = `job:${jobId}`;
-  const stateRaw = await env.SPRITEBREW_KV.get(stateKey);
-  const state = stateRaw ? (JSON.parse(stateRaw) as JobState) : null;
+  let next: Next;
+  try {
+    next = await deliver(msg, env, log);
+  } catch (err) {
+    // A throw never refunds: the row is the durable debt, and the message
+    // comes back (a staged result goes to c-finalize, 4.9).
+    log('error', 'delivery threw; retrying', { error: errText(err).slice(0, 300) });
+    next = retryIn(null);
+  }
+  apply(msg, next);
+}
 
-  // === 0a. Terminal — success (with self-heal for gallery-write race).
-  if (state?.status === 'success') {
-    try {
-      const pngBytes = base64ToBytes(state.resultBase64);
-      await writeGalleryEntry(
-        env,
-        {
-          jobId,
-          userId,
-          pngBytes,
-          prompt: body.prompt,
-          style: body.prompt_style,
-          mode,
-          createdAt: state.completedAt,
-          // Carry the marker forward from the recorded success — a self-heal
-          // must rewrite the same row, not a row that has forgotten it was
-          // a rescue.
-          ...(state.rescued ? { rescued: true as const } : {}),
-        },
-        log
-      );
-    } catch (galleryErr) {
-      log('error', 'self-healing gallery write failed; retrying message', {
-        error: errText(galleryErr),
-      });
-      msg.retry();
-      return;
-    }
-    log('info', 'job already terminal (success); self-heal complete; acking');
-    msg.ack();
-    return;
+/** 5.2's table, in order. The row is read once; release 1's pause gate keeps
+ *  its place, after the resume branch and before 0d, 0e and the pre-flight. */
+async function deliver(msg: Message<JobMessage>, env: Env, log: Logger): Promise<Next> {
+  const { jobId, mode } = msg.body;
+  const attempt = msg.attempts ?? 1;
+  const ctx = ledgerCtx(env);
+  const ev = { attempt, queueMessageId: msg.id, ctx: messageContext(msg.body) };
+
+  let row = await readJobRow(env, jobId);
+  if (!row) {
+    // No row: the tombstone (guarded) and its alarm.
+    const t = await tombstoneJob(env, msg.body, log);
+    if (t === 'tombstoned') return ACK;
+    if (t === 'paused') return retryIn(await pausedRetryDelayS(env));
+    if (t === 'error') return retryIn(null);
+    row = await readJobRow(env, jobId);
+    if (!row) return retryIn(null);
+  }
+  if (row.hold_reason !== null) {
+    log('info', 'held row: nothing run, nothing paid', { holdReason: row.hold_reason });
+    return ACK;
+  }
+  if (row.finished_at_ms !== null) {
+    // Finished: ack, after the repair pass for this row (phase '0' only).
+    const list = await L.repairList(ctx);
+    if (list.outcome === 'phase_open') return retryIn(PAUSED_RETRY_S);
+    await repairOne(env, row as unknown as Record<string, unknown>, log);
+    return ACK;
+  }
+  if (row.artifact === 'staged') {
+    const claim = crypto.randomUUID();
+    const c = await L.claimJob(ctx, 'finalize', { job: jobId, claim, attempt });
+    if (c.outcome === 'won') return finishStaged(env, row, claim, ev, log);
+    if (c.outcome === 'held') return ACK;
+    if (c.outcome === 'error' || c.outcome === 'no_row') return retryIn(null);
+    // owner live, or the migrator's phase open
+    return retryIn(PAUSED_RETRY_S);
+  }
+  if (row.refund_due_code !== null) {
+    // An imported debt: the delivered checks decide; never RD.
+    return deliveredChecks(env, row, ev, log);
+  }
+  if (row.task_id !== null) {
+    const claim = crypto.randomUUID();
+    const c = await L.claimJob(ctx, 'resume', { job: jobId, claim, attempt });
+    if (c.outcome === 'won') return resumeTask(env, msg, row, claim, log);
+    if (c.outcome === 'phase_open') return retryIn(PAUSED_RETRY_S);
+    if (c.outcome === 'held') return ACK;
+    if (c.outcome === 'error' || c.outcome === 'no_row') return retryIn(null);
+    return liveOwner(attempt);
   }
 
-  // === 0b. Terminal — error.
-  if (state?.status === 'error') {
-    log('info', 'job already terminal (error); acking', {
-      existingStatus: state.status,
-    });
-    msg.ack();
-    return;
-  }
-
-  // === 0f. A refund owed from a failure while money was paused (n1-ledger
-  //     005 section 4). The job never runs again and RD is never called: make
-  //     the refund once money reopens, else wait.
-  if (state?.status === 'running' && state.refundDue) {
-    if (await isMoneyPaused(env)) {
-      const delaySeconds = await pausedRetryDelayS(env);
-      log('info', 'refund due but money paused; retrying later', {
-        errorCode: state.refundDue.errorCode,
-        delaySeconds,
-      });
-      msg.retry({ delaySeconds });
-      return;
-    }
-    await recordFailure(
-      env,
-      msg,
-      state.startedAt,
-      new Error(state.refundDue.error ?? 'generation failed while money writes were paused'),
-      state.refundDue.errorCode,
-      log
-    );
-    return;
-  }
-
-  // === 0c. Redelivery with taskId → resume polling that task.
-  //     Applies to any running-state that captured a taskId (animate today).
-  //     We SKIP status pre-flight and SKIP submission entirely: the task
-  //     already exists on RD's side. Poll-budget exhaustion here uses the
-  //     SAME retry-not-refund policy as fix 1 below: RD task is still live
-  //     and billing; redelivery re-enters this branch with a fresh budget.
-  //     Only on the final attempt do we terminal-fail with rd_async_timeout.
-  if (state?.status === 'running' && state.taskId) {
-    log('info', 'redelivery: resuming poll of existing task', {
-      taskId: state.taskId,
-      originalStartedAt: state.startedAt,
-      originalSubmitAttemptedAt: state.submitAttemptedAt,
-      // Present iff the task being resumed is a fallback's — see below.
-      resumingRescue: state.rescue !== undefined,
-    });
-    try {
-      // Poll before sleeping: this task already ran a full budget and may be done.
-      const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, state.taskId, undefined, { pollFirst: true });
-      log('info', 'resume-poll succeeded', {
-        taskId: state.taskId,
-        balance_cost: result.balance_cost,
-        remaining_balance: result.remaining_balance,
-      });
-      // A resumed FALLBACK task is still a rescue: the marker persisted at
-      // submit time tells us so, and this invocation now has the sheet, so
-      // it can finish the descriptor. Without the marker (a resumed PRIMARY
-      // task) this stays undefined and recordSuccess behaves as before.
-      const rescue = state.rescue
-        ? buildRescueInfo(
-            state.rescue,
-            result.base64_images[0],
-            state.taskId,
-            (msg.body.body as RdAnimateBody).frames_duration,
-            log
-          )
-        : undefined;
-      await recordSuccess(env, msg, state.startedAt, result, log, rescue);
-    } catch (err) {
-      if (isPollBudgetExceeded(err) && attempt < MAX_ATTEMPTS) {
-        log('warn', 'resume-poll budget exhausted; task still live; redelivering to re-poll same taskId', {
-          taskId: state.taskId,
-          attempt,
-          nextAttempt: attempt + 1,
-        });
-        await recordEvent(env, {
-          eventName: 'provider.poll_budget_exhausted',
-          level: 'warn',
-          dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
-          userId, jobId, attempt,
-          provider: PROVIDER,
-          providerJobId: state.taskId,
-          extra: { finalAttempt: false },
-        }, log);
-        // No delay: the task is still live on RD and may already be done.
-        msg.retry({ delaySeconds: 0 });
-        return;
-      }
-      // Final attempt or non-budget error → terminal.
-      // For a poll-budget final failure we log the bounded orphan class: the
-      // refund we're about to fire may precede a late RD completion (bill
-      // lands, we already refunded — visible in ops as duplicate cost).
-      if (isPollBudgetExceeded(err)) {
-        log('error', 'resume-poll budget exhausted on final attempt; refunding despite live task (bounded orphan)', {
-          taskId: state.taskId,
-          attempt,
-        });
-        await recordEvent(env, {
-          eventName: 'provider.poll_budget_exhausted',
-          level: 'warn',
-          dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
-          userId, jobId, attempt,
-          provider: PROVIDER,
-          providerJobId: state.taskId,
-          extra: { finalAttempt: true },
-        }, log);
-      }
-      await recordFailure(env, msg, state.startedAt, err, classifyError(err), log);
-    }
-    return;
-  }
-
-  // === Money pause gate (n1-ledger 007 section 4, rulings A and B). After
-  //     0c (a resume poll bills nothing) and before 0d, 0e, the pre-flight
-  //     and the running write: while paused, nothing is written and RD is
-  //     not called. The message is held; past its last delivery it
-  //     dead-letters and the dead-letter handler refunds it after the pause.
+  // === The pause gate (release 1's place: A4, `L 006` A, `L 008` B). While
+  //     paused, nothing is written and no RD call of any kind is made.
   if (await isMoneyPaused(env)) {
     const delaySeconds = await pausedRetryDelayS(env);
-    log('warn', 'money paused; holding message, no RD call', {
-      delaySeconds,
-      recordStatus: state?.status ?? 'absent',
-      lastDelivery: attempt > MAX_ATTEMPTS,
-    });
-    msg.retry({ delaySeconds });
-    return;
+    log('warn', 'money paused; holding message, no RD call', { delaySeconds, lastDelivery: attempt > MAX_ATTEMPTS });
+    return retryIn(delaySeconds);
   }
 
-  // === 0d. Redelivery with submitAttemptedAt + no taskId → orphaned submit.
-  //     RD may or may not have created a task from the previous invocation's
-  //     submit; there is no recovery (no task-list endpoint per probe). Fail
-  //     terminally with the marker code so ops can identify the class.
-  if (state?.status === 'running' && state.submitAttemptedAt && !state.taskId) {
-    log('error', 'redelivery: submit orphaned (no task_id captured); no recovery available', {
-      submitAttemptedAt: state.submitAttemptedAt,
-    });
-    await recordFailure(
-      env,
-      msg,
-      state.startedAt,
-      new Error('submit orphaned on redelivery — RD may have created a task we lost'),
-      'rd_submit_orphaned_redelivery',
-      log
-    );
-    return;
+  const now = Date.now();
+  if (row.submitted_at_ms !== null) {
+    if (!isStale(row, now)) return liveOwner(attempt);
+    if (row.provenance === 'kv') return deliveredChecks(env, row, ev, log);
+    const code = row.mode === 'animate' ? 'rd_submit_orphaned_redelivery' : 'rd_create_outcome_unknown';
+    log('error', 'a submit with no outcome on record; refunding, never RD', { code });
+    const r = await refundTokens(env, { job: jobId, fence: 'canceller', code }, log);
+    return afterCanceller(env, row, r, code, ev, log);
   }
+  if (row.claim_id !== null && !isStale(row, now)) return liveOwner(attempt);
 
-  // === 0e. Running with no async markers, still inside the running window.
-  //     This is either (a) a genuinely concurrent duplicate delivery — a live
-  //     sibling invocation is mid-run — or (b) a redelivery whose previous
-  //     invocation DIED before writing any terminal state (the create-path
-  //     isolate-kill orphan). We tell them apart by msg.attempts:
-  //
-  //       attempt === 1 → first delivery of THIS message; a running record we
-  //         didn't write means a sibling is live → ack as a true duplicate.
-  //       attempt  >  1 → THIS message was already delivered and failed to
-  //         terminate; its prior invocation is the one that wrote this record
-  //         and then died. Acking here is exactly the bug: it consumes the
-  //         message with no refund and no terminal state, and the record then
-  //         expires at its 1h TTL. Defer instead so it re-enters after the
-  //         window ages out, where the fall-through path reclaims it (fresh
-  //         run) or a terminal write happens. The stale-running sweep (cron)
-  //         is the backstop that guarantees a refund even if this DLQs first.
-  //
-  //     (msg.attempts starts at 1 on the first delivery, so attempt > 1 is
-  //     strictly a redelivery.)
-  if (
-    state?.status === 'running' &&
-    !state.taskId &&
-    !state.submitAttemptedAt &&
-    !state.releasedAt &&
-    Date.now() - state.startedAt < RUNNING_TIMEOUT_MS
-  ) {
-    if (attempt === 1) {
-      log('warn', 'another invocation is running this job; acking duplicate', {
-        startedAt: state.startedAt,
-      });
-      msg.ack();
-      return;
-    }
-    log('warn', 'legacy-running on redelivery - deferring instead of acking', {
-      startedAt: state.startedAt,
-      attempt,
-      ageMs: Date.now() - state.startedAt,
-    });
-    msg.retry({ delaySeconds: 30 });
-    return;
-  }
-
-  // === 1. Status pre-flight (animate only). GET is best-effort; a fetch
-  //     error, non-2xx, or absent status.animations field is 'absent' →
-  //     fail open → proceed. RD's own "unknown" also proceeds. Only another
-  //     explicit non-"ok" flag ('degraded') defers. The
-  //     logger is passed so the raw status body lands in this job's log
-  //     stream (one line per call, see checkRdAnimationsStatus).
+  // === The fresh path: the pre-flight (animate), then c-submit (guarded).
   if (mode === 'animate') {
     const rdStatus = await checkRdAnimationsStatus(log);
     const shouldRetry = rdStatus === 'degraded' && attempt < MAX_ATTEMPTS;
-    log('info', 'rd status pre-flight', {
-      rdStatus,
-      decision: shouldRetry ? `retry in ${STATUS_RETRY_DELAY_S}s` : 'proceed',
-    });
-    if (shouldRetry) {
-      msg.retry({ delaySeconds: STATUS_RETRY_DELAY_S });
-      return;
-    }
+    log('info', 'rd status pre-flight', { rdStatus, decision: shouldRetry ? `retry in ${STATUS_RETRY_DELAY_S}s` : 'proceed' });
+    if (shouldRetry) return retryIn(STATUS_RETRY_DELAY_S);
   }
+  const claim = crypto.randomUUID();
+  const c = await L.claimJob(ctx, 'submit', { job: jobId, claim, attempt });
+  if (c.outcome === 'paused') return retryIn(await pausedRetryDelayS(env));
+  if (c.outcome === 'held') return ACK;
+  if (c.outcome !== 'won') return c.outcome === 'error' || c.outcome === 'no_row' ? retryIn(null) : liveOwner(attempt);
+  return runFresh(env, msg, claim, log);
+}
 
-  // === 2. Write running state. For animate we ALSO mark submitAttemptedAt
-  //     before the submit fires, so a mid-submit crash is detectable on
-  //     redelivery. Create keeps the legacy shape (no async fields).
+/** After c-submit won: the `running` record (without tokenCost, 4.10), then
+ *  the phase (5.2). */
+async function runFresh(env: Env, msg: Message<JobMessage>, claim: string, log: Logger): Promise<Next> {
+  const { jobId, userId, mode, body } = msg.body;
+  const attempt = msg.attempts ?? 1;
+  const ctx = ledgerCtx(env);
   const startedAt = Date.now();
-  const runningState: JobStateRunning = {
-    status: 'running',
-    userId,
-    mode,
-    enqueuedAt: msg.body.enqueuedAt,
-    startedAt,
-    attempt,
-    // Persisted so the stale-running cron sweep can refund without the message.
-    tokenCost,
-  };
-  if (mode === 'animate') {
-    runningState.submitAttemptedAt = startedAt;
-  }
-  await putJobState(env, jobId, runningState, log);
+  await putRunningBestEffort(env, jobId, { userId, mode, enqueuedAt: msg.body.enqueuedAt, startedAt, attempt }, log);
+  const ev = { attempt, queueMessageId: msg.id, ctx: messageContext(msg.body) };
 
-  // === 3. Call RD.
-  try {
-    const outcome: AnimateOutcome =
-      mode === 'animate'
-        ? await runAnimateAsync(
-            env,
-            stateKey,
-            runningState,
-            body as RdAnimateBody,
-            fallbackInputImage,
-            log,
-            jobId
-          )
-        : { result: await callRd(env.RETRO_DIFFUSION_API_KEY, 'create', body) };
-
-    const { result, rescue } = outcome;
-
-    log('info', 'rd success', {
-      rdLatencyMs: Date.now() - startedAt,
-      rdBalanceCost: result.balance_cost,
-      rdRemainingBalance: result.remaining_balance,
-      rescued: rescue !== undefined,
-    });
-
-    await recordSuccess(env, msg, startedAt, result, log, rescue);
-    return;
-  } catch (err) {
-    const errorCode = classifyError(err);
-    const isRdError = err instanceof RdError;
-    const retryable = isRdError ? err.retryable : true;
-    const errMsg = errText(err);
-
-    // The poll-budget ledger rows below need the taskId the error names, and
-    // taskIdFromPollError reads it off a message string. Make a silent break
-    // visible (ruling wd2 003.3): warn once here, still write the rows with
-    // providerJobId absent.
-    const pollTaskId = isPollBudgetExceeded(err) ? taskIdFromPollError(err) : undefined;
-    if (isPollBudgetExceeded(err) && pollTaskId === undefined) {
-      log('warn', 'poll-budget taskId parse failed', { errMsg });
-    }
-
-    // Fix 1: poll-budget exhaustion on the FRESH run's primary poll.
-    // runAnimateAsync must NOT fallback (see comment there); the task is
-    // still live and holds the taskId in state.taskId. Redeliver so guard
-    // 0c resumes polling the same task with a fresh budget. No new submit,
-    // no new bill, no fallback. Only the final attempt terminals.
-    if (isPollBudgetExceeded(err) && attempt < MAX_ATTEMPTS) {
-      log('warn', 'primary poll budget exhausted; task still live; redelivering to re-poll same taskId', {
-        errMsg,
-        attempt,
-        nextAttempt: attempt + 1,
-      });
-      await recordEvent(env, {
-        eventName: 'provider.poll_budget_exhausted',
-        level: 'warn',
-        dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
-        userId, jobId, attempt,
-        provider: PROVIDER,
-        providerJobId: pollTaskId,
-        extra: { finalAttempt: false },
-      }, log);
-      // No delay: the task is still live on RD and may already be done.
-      msg.retry({ delaySeconds: 0 });
-      return;
-    }
-    if (isPollBudgetExceeded(err)) {
-      log('error', 'primary poll budget exhausted on final attempt; refunding despite live task (bounded orphan)', {
-        errMsg,
-        attempt,
-      });
-      await recordEvent(env, {
-        eventName: 'provider.poll_budget_exhausted',
-        level: 'warn',
-        dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
-        userId, jobId, attempt,
-        provider: PROVIDER,
-        providerJobId: pollTaskId,
-        extra: { finalAttempt: true },
-      }, log);
-    }
-
-    log('error', 'rd call failed', {
-      errMsg,
-      errorCode,
-      retryable,
-      willRetry: retryable && attempt < MAX_ATTEMPTS,
-    });
-
-    // Retryable + retries remain → don't refund yet, just retry.
-    // Async submit errors are NON-retryable by construction (billing
-    // safety: submit orphans, per receipt 6, must not resubmit) so they'll
-    // skip this branch and fall through to refund.
-    if (retryable && attempt < MAX_ATTEMPTS) {
-      // Create only: this invocation's call has ended, so release the record
-      // and let the next delivery run at once instead of being deferred by
-      // the legacy-running guard. Animate records are not touched: this
-      // local copy lacks the taskId persisted after submit.
-      if (mode === 'create') {
-        await writeStateUnlessTerminal(env, stateKey, { ...runningState, releasedAt: Date.now() }, log);
+  if (mode === 'create') {
+    const u = await L.ownerUpdate(ctx, 'submitted', { job: jobId, claim });
+    if (u === 'ownership_lost') return ACK;
+    if (u === 'retry_message') return retryIn(null);
+    const pollStartedAt = Date.now();
+    let result: RdSuccessResponse;
+    try {
+      result = await callRd(env.RETRO_DIFFUSION_API_KEY, 'create', body);
+    } catch (err) {
+      const errorCode = classifyError(err);
+      const retryable = err instanceof RdError ? err.retryable : true;
+      log('error', 'rd call failed', { errMsg: errText(err), errorCode, retryable, willRetry: retryable && attempt < MAX_ATTEMPTS });
+      // The 240 s create timeout and a 524 are not retryable: they keep
+      // submitted_at_ms (no release, `L 004` ruling 7) and go to the refund.
+      if (retryable && attempt < MAX_ATTEMPTS) {
+        const rel = await L.ownerUpdate(ctx, 'release_create', { job: jobId, claim });
+        return rel === 'ownership_lost' ? ACK : retryIn(null);
       }
-      msg.retry();
-      return;
+      return ownerFails(env, jobId, claim, errorCode, errText(err), { ...ev, latencyMs: Date.now() - startedAt, retryable }, log);
     }
+    return succeed(env, msg, claim, result, { startedAt, pollStartedAt, pollEndedAt: Date.now() }, undefined, log);
+  }
 
-    await recordFailure(env, msg, startedAt, err, errorCode, log);
+  let outcome: AnimateOutcome;
+  try {
+    outcome = await runAnimateAsync(env, ctx, claim, msg, log);
+  } catch (err) {
+    if (err instanceof OwnershipStop) return err.next;
+    return animateFailed(env, msg, claim, err, startedAt, log);
+  }
+  return succeed(env, msg, claim, outcome.result, { startedAt, pollStartedAt: outcome.pollStartedAt, pollEndedAt: outcome.pollEndedAt }, outcome.rescue, log);
+}
+
+/** An owner update that lost its claim, or a second doubt: stop the run,
+ *  call nothing billable (4.7). */
+class OwnershipStop extends Error {
+  constructor(public next: Next) {
+    super('ownership stop');
+  }
+}
+
+async function ownerStep(ctx: L.LedgerCtx, kind: L.OwnerUpdateKind, u: L.OwnerUpdateInput): Promise<void> {
+  const r = await L.ownerUpdate(ctx, kind, u);
+  if (r === 'ownership_lost') throw new OwnershipStop(ACK);
+  if (r === 'retry_message') throw new OwnershipStop(retryIn(null));
+}
+
+async function animateFailed(env: Env, msg: Message<JobMessage>, claim: string, err: unknown, startedAt: number, log: Logger): Promise<Next> {
+  const { jobId, userId } = msg.body;
+  const attempt = msg.attempts ?? 1;
+  const ctx = ledgerCtx(env);
+  const errorCode = classifyError(err);
+  const pollTaskId = isPollBudgetExceeded(err) ? taskIdFromPollError(err) : undefined;
+  if (isPollBudgetExceeded(err)) {
+    await recordEvent(env, {
+      eventName: 'provider.poll_budget_exhausted',
+      level: 'warn',
+      dedupeKey: `${jobId}:provider.poll_budget_exhausted:attempt_${attempt}`,
+      userId, jobId, attempt,
+      provider: PROVIDER,
+      providerJobId: pollTaskId,
+      extra: { finalAttempt: attempt >= MAX_ATTEMPTS },
+    }, log);
+    if (attempt < MAX_ATTEMPTS) {
+      // The task stays: the keep-task release, then redeliver at once to
+      // resume polling the same task (c-resume).
+      const rel = await L.ownerUpdate(ctx, 'release_animate', { job: jobId, claim });
+      return rel === 'ownership_lost' ? ACK : retryIn(0);
+    }
+    log('error', 'poll budget exhausted on the final attempt; refunding despite a live task (bounded orphan)', { taskId: pollTaskId });
+  }
+  log('error', 'rd call failed', { errMsg: errText(err), errorCode });
+  return ownerFails(env, jobId, claim, errorCode, errText(err), {
+    attempt, queueMessageId: msg.id, ctx: messageContext(msg.body), latencyMs: Date.now() - startedAt,
+    retryable: err instanceof RdError ? err.retryable : true,
+  }, log);
+}
+
+/** c-resume won: poll first; then 4.9 or 4.8 `'owner'` (5.2). */
+async function resumeTask(env: Env, msg: Message<JobMessage>, row: JobRow, claim: string, log: Logger): Promise<Next> {
+  const startedAt = Date.now();
+  log('info', 'resuming the poll of an existing task', { taskId: row.task_id, phase: row.phase });
+  const pollStartedAt = Date.now();
+  try {
+    const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, row.task_id as string, undefined, { pollFirst: true });
+    const rescue = row.phase === 'fallback'
+      ? buildRescueInfo(
+          { requestedWidth: msg.body.body.width, requestedHeight: msg.body.body.height, deliveredCellSize: FALLBACK_CELL_SIZE },
+          result.base64_images[0], row.task_id as string, (msg.body.body as RdAnimateBody).frames_duration, log)
+      : undefined;
+    return succeed(env, msg, claim, result, { startedAt, pollStartedAt, pollEndedAt: Date.now() }, rescue, log);
+  } catch (err) {
+    return animateFailed(env, msg, claim, err, startedAt, log);
   }
 }
 
 // ─── Animate async orchestration ───────────────────────────────────────────
 
 /**
- * Full animate flow: primary async submit + poll, with a single-attempt
- * fallback on failure. Persists the task_id to KV immediately after each
- * submit so redelivery can resume polling instead of resubmitting (billing
- * safety per receipt 6: no task-list recovery endpoint).
- *
- * Returns the RD result plus, when the fallback served it, a RescueInfo the
- * caller records on the success state. WHEN a rescue happens is unchanged by
- * the July-16 work — only whether we describe it afterwards.
+ * Full animate flow on the claim: `submitted`, then the primary async submit,
+ * the `task` update before any poll, then the poll; on a primary failure of
+ * rd_advanced_animation__*, the `fallback` update first (no reclaim), its
+ * submit, `task`, poll (5.2). WHEN a rescue happens is unchanged.
  */
 async function runAnimateAsync(
   env: Env,
-  stateKey: string,
-  runningState: JobStateRunning,
-  body: RdAnimateBody,
-  fallbackInputImage: string | undefined,
-  log: Logger,
-  /** For the ledger rows only; the running state does not carry it. */
-  jobId: string
+  ctx: L.LedgerCtx,
+  claim: string,
+  msg: Message<JobMessage>,
+  log: Logger
 ): Promise<AnimateOutcome> {
-  // Requested geometry, captured before any clamp. `body` is never mutated
-  // (the fallback builds a copy), but reading these up front keeps the
-  // rescue descriptor honest even if that ever changes.
+  const { jobId, userId } = msg.body;
+  const body = msg.body.body as RdAnimateBody;
+  const fallbackInputImage = msg.body.fallbackInputImage;
+  const attempt = msg.attempts ?? 1;
   const requestedWidth = body.width;
   const requestedHeight = body.height;
-
-  // Dev-only: skip the primary entirely and synthesize its failure, so the
-  // rescue path can be exercised on demand. The fallback's own eligibility
-  // gates below are NOT bypassed — forcing a rescue on a job that could
-  // never rescue in production would be a test that proves nothing.
   const forceFallback = env.FORCE_ANIMATE_FALLBACK === 'true';
 
-  // Primary attempt.
   let primaryErr: unknown;
   if (forceFallback) {
     log('warn', 'FORCE_ANIMATE_FALLBACK active - dev testing only', {
-      promptStyle: body.prompt_style,
-      requestedWidth,
-      requestedHeight,
+      promptStyle: body.prompt_style, requestedWidth, requestedHeight,
       effect: 'primary submit skipped; going straight to fallback',
     });
-    primaryErr = new RdError(
-      'FORCE_ANIMATE_FALLBACK: primary submit skipped (dev testing only)',
-      0,
-      false,
-      ''
-    );
+    primaryErr = new RdError('FORCE_ANIMATE_FALLBACK: primary submit skipped (dev testing only)', 0, false, '');
   } else {
+    // `submitted`: immediately before the billable call, and read back
+    // committed before it is made (4.7, R3-17).
+    await ownerStep(ctx, 'submitted', { job: jobId, claim });
     try {
-      const { taskId, submitElapsedMs } = await submitAsyncTask(
-        env.RETRO_DIFFUSION_API_KEY,
-        body
-      );
-      log('info', 'primary async submit accepted', {
-        taskId,
-        submitElapsedMs,
-        promptStyle: body.prompt_style,
-        width: body.width,
-        height: body.height,
-      });
+      const { taskId, submitElapsedMs } = await submitAsyncTask(env.RETRO_DIFFUSION_API_KEY, body);
+      log('info', 'primary async submit accepted', { taskId, submitElapsedMs, promptStyle: body.prompt_style, width: body.width, height: body.height });
       await recordEvent(env, {
         eventName: 'provider.submit_accepted',
         level: 'info',
         dedupeKey: `${jobId}:provider.submit_accepted:${taskId}`,
-        userId: runningState.userId,
-        jobId,
-        attempt: runningState.attempt,
+        userId, jobId, attempt,
         provider: PROVIDER,
         providerJobId: taskId,
         latencyMs: submitElapsedMs,
         style: body.prompt_style,
         requestedSize: `${requestedWidth}x${requestedHeight}`,
       }, log);
-
-      // Persist task_id BEFORE polling so a poll-time crash resumes correctly.
-      // Routed through writeStateUnlessTerminal (fix 2): a concurrent
-      // redelivery may have already committed a terminal state; we must not
-      // overwrite it here with a stale 'running' record.
-      const withTaskId: JobStateRunning = { ...runningState, taskId };
-      await writeStateUnlessTerminal(env, stateKey, withTaskId, log);
-
-      return { result: await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, taskId) };
+      await ownerStep(ctx, 'task', { job: jobId, claim, task: taskId });
+      const pollStartedAt = Date.now();
+      const result = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, taskId);
+      return { result, pollStartedAt, pollEndedAt: Date.now() };
     } catch (err) {
+      if (err instanceof OwnershipStop) throw err;
       primaryErr = err;
     }
   }
 
-  // Fix 1: poll-budget exhaustion is NOT a fallback trigger. The RD task
-  // is still live and will bill; falling back would submit a second job for
-  // one request AND discard a retrievable result. Re-throw and let the
-  // outer handler redeliver so guard 0c can resume-poll the same taskId.
-  // Fallback stays eligible ONLY for terminal task-failure statuses, poll
-  // 4xx (task rejected/vanished), and submit orphans — cases where the
-  // primary is genuinely unrecoverable.
-  if (isPollBudgetExceeded(primaryErr)) {
-    throw primaryErr;
-  }
+  // Poll-budget exhaustion is not a fallback trigger: the task is live and
+  // will bill; the caller releases it and redelivers to resume the poll.
+  if (isPollBudgetExceeded(primaryErr)) throw primaryErr;
+  if (!(primaryErr instanceof RdError) || !body.prompt_style.startsWith('rd_advanced_animation__')) throw primaryErr;
 
-  // Fallback consideration. Only for RdErrors on rd_advanced_animation__* —
-  // preserves the pre-existing semantics (fallback is a rescue for that
-  // specific style family). Other errors propagate unchanged.
-  if (
-    !(primaryErr instanceof RdError) ||
-    !body.prompt_style.startsWith('rd_advanced_animation__')
-  ) {
-    throw primaryErr;
-  }
-
-  // Fallback shape (probe C3/C4/C5/C6):
-  //   - prompt_style: animation__any_animation
-  //   - width/height CLAMPED to 64 (C5: >64 is deterministic 400 on this style)
-  //   - frames_duration KEPT (C4: tolerated at 64px)
-  //   - remove_bg KEPT (C6: honored on any_animation, hard 1-bit alpha)
-  //   - input_image: envelope's fallbackInputImage if present; otherwise
-  //     reuse body.input_image only when the original request was already
-  //     64px. Oversized reuse = deterministic 400, so we skip fallback.
   const hasEnvelopeInput = typeof fallbackInputImage === 'string' && fallbackInputImage.length > 0;
-  const canUseOriginalInput =
-    requestedWidth <= FALLBACK_CELL_SIZE && requestedHeight <= FALLBACK_CELL_SIZE;
-
+  const canUseOriginalInput = requestedWidth <= FALLBACK_CELL_SIZE && requestedHeight <= FALLBACK_CELL_SIZE;
   if (!hasEnvelopeInput && !canUseOriginalInput) {
     log('warn', 'fallback unavailable: no 64px input in envelope; primary failure will propagate', {
-      originalWidth: requestedWidth,
-      originalHeight: requestedHeight,
-      primaryError: errText(primaryErr),
+      originalWidth: requestedWidth, originalHeight: requestedHeight, primaryError: errText(primaryErr),
     });
     throw primaryErr;
   }
-
   const fallbackBody: RdAnimateBody = {
     ...body,
     prompt_style: 'animation__any_animation',
     width: FALLBACK_CELL_SIZE,
     height: FALLBACK_CELL_SIZE,
     input_image: hasEnvelopeInput ? fallbackInputImage : body.input_image,
-    // frames_duration and remove_bg carried via spread — no delete.
   };
-
   log('info', 'attempting fallback', {
-    reason: forceFallback
-      ? 'FORCE_ANIMATE_FALLBACK (dev testing only)'
-      : 'primary rd_advanced_animation__ failed',
-    primaryStatus: primaryErr.status,
-    primaryMessage: errText(primaryErr),
-    fallbackShape: `${FALLBACK_CELL_SIZE}x${FALLBACK_CELL_SIZE}`,
-    usedEnvelopeInput: hasEnvelopeInput,
-    fallbackKeepsRemoveBg: body.remove_bg === true,
+    reason: forceFallback ? 'FORCE_ANIMATE_FALLBACK (dev testing only)' : 'primary rd_advanced_animation__ failed',
+    primaryStatus: primaryErr.status, primaryMessage: errText(primaryErr),
+    fallbackShape: `${FALLBACK_CELL_SIZE}x${FALLBACK_CELL_SIZE}`, usedEnvelopeInput: hasEnvelopeInput,
   });
-
-  const { taskId: fallbackTaskId, submitElapsedMs: fallbackSubmitMs } =
-    await submitAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackBody);
-
-  log('info', 'fallback async submit accepted', {
-    taskId: fallbackTaskId,
-    submitElapsedMs: fallbackSubmitMs,
-  });
-  // Ledger (ruling wd2 003.7): a rescue is the one path where RD bills twice
-  // for one request. style and requestedSize here describe what was actually
-  // submitted (the fallback shape); the customer's ask is on the terminal
-  // generation.rescued row. Distinct dedupe key via the fallback taskId.
+  // The same owner moves to the fallback phase first (4.7): no reclaim.
+  await ownerStep(ctx, 'fallback', { job: jobId, claim });
+  const { taskId: fallbackTaskId, submitElapsedMs: fallbackSubmitMs } = await submitAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackBody);
+  log('info', 'fallback async submit accepted', { taskId: fallbackTaskId, submitElapsedMs: fallbackSubmitMs });
   await recordEvent(env, {
     eventName: 'provider.submit_accepted',
     level: 'info',
     dedupeKey: `${jobId}:provider.submit_accepted:${fallbackTaskId}`,
-    userId: runningState.userId,
-    jobId,
-    attempt: runningState.attempt,
+    userId, jobId, attempt,
     provider: PROVIDER,
     providerJobId: fallbackTaskId,
     latencyMs: fallbackSubmitMs,
@@ -895,295 +636,113 @@ async function runAnimateAsync(
     requestedSize: `${FALLBACK_CELL_SIZE}x${FALLBACK_CELL_SIZE}`,
     extra: { fallback: true, primaryError: errText(primaryErr).slice(0, 300) },
   }, log);
-
-  // Overwrite primary's taskId — one taskId in the running state at a time.
-  // On redelivery, we resume THIS task (the last one attempted).
-  // Same terminal-guard as the primary persist (fix 2).
-  //
-  // The rescue marker rides along in this SAME put (no extra KV op): from
-  // here on, the persisted state says this taskId is a fallback's, so a
-  // redelivery that resumes it (guard 0c) still knows to mark the delivery
-  // as a rescue. Without this the marker would live only in this function's
-  // scope and die with the invocation.
-  const rescueMarker: RescueMarker = {
-    requestedWidth,
-    requestedHeight,
-    deliveredCellSize: FALLBACK_CELL_SIZE,
-  };
-  const withFallbackTaskId: JobStateRunning = {
-    ...runningState,
-    taskId: fallbackTaskId,
-    rescue: rescueMarker,
-  };
-  await writeStateUnlessTerminal(env, stateKey, withFallbackTaskId, log);
-
+  await ownerStep(ctx, 'task', { job: jobId, claim, task: fallbackTaskId });
+  const pollStartedAt = Date.now();
   const fallbackResult = await pollAsyncTask(env.RETRO_DIFFUSION_API_KEY, fallbackTaskId);
-
-  // The fallback delivered — describe the rescue for the client. Frame count
-  // is measured from what actually came back rather than from what we asked
-  // for: the request said 64×64 with frames_duration, but the sheet's real
-  // layout is the only thing that slices correctly.
-  const rescue = buildRescueInfo(
-    rescueMarker,
-    fallbackResult.base64_images[0],
-    fallbackTaskId,
-    body.frames_duration,
-    log
-  );
-
-  return { result: fallbackResult, rescue };
+  const rescueMarker: RescueMarker = { requestedWidth, requestedHeight, deliveredCellSize: FALLBACK_CELL_SIZE };
+  const rescue = buildRescueInfo(rescueMarker, fallbackResult.base64_images[0], fallbackTaskId, body.frames_duration, log);
+  return { result: fallbackResult, rescue, pollStartedAt, pollEndedAt: Date.now() };
 }
 
-// ─── Success / failure recorders (shared by fresh and resume paths) ────────
+// ─── Success (4.9) ─────────────────────────────────────────────────────────
 
-async function recordSuccess(
+/**
+ * 4.9's steps for the owner: stage (the update, then the PNG with its bounded
+ * retry and `head`), the success update, publish, the status, the marker.
+ * After the stage, a staged result is never refunded by this owner's failure
+ * path: any throw or doubt retries the message, and the staged row goes to
+ * c-finalize (A4). The only refund here is step 4's verified "cannot be made
+ * durable", with `result_store_failed`.
+ */
+async function succeed(
   env: Env,
   msg: Message<JobMessage>,
-  startedAt: number,
+  claim: string,
   result: RdSuccessResponse,
-  log: Logger,
-  /** Present iff the animate fallback produced this result. Absent on every
-   *  normal success, which keeps those records byte-identical to today's. */
-  rescue?: RescueInfo
-): Promise<void> {
+  times: { startedAt: number; pollStartedAt?: number; pollEndedAt?: number },
+  rescue: RescueInfo | undefined,
+  log: Logger
+): Promise<Next> {
   const { jobId, userId, mode, body } = msg.body;
-  const stateKey = `job:${jobId}`;
+  const attempt = msg.attempts ?? 1;
+  const ctx = ledgerCtx(env);
   const completedAt = Date.now();
+  const meta: ArtifactMeta = {
+    v: 1,
+    createdAt: completedAt,
+    prompt: body.prompt,
+    style: body.prompt_style,
+    mode,
+    enqueuedAt: msg.body.enqueuedAt,
+    startedAt: times.startedAt,
+    ...(times.pollStartedAt !== undefined ? { pollStartedAt: times.pollStartedAt } : {}),
+    ...(times.pollEndedAt !== undefined ? { pollEndedAt: times.pollEndedAt } : {}),
+    ...(result.balance_cost !== undefined ? { rdBalanceCost: result.balance_cost } : {}),
+    ...(rescue
+      ? { rescue: { requestedWidth: rescue.requestedWidth, requestedHeight: rescue.requestedHeight, deliveredCellSize: rescue.deliveredCellSize, ...(rescue.deliveredFrames !== undefined ? { deliveredFrames: rescue.deliveredFrames } : {}) } }
+      : {}),
+  };
 
-  // Fix 2 special case: we hold a fresh RD result, but the KV state may
-  // ALREADY be terminal 'error' because a concurrent redelivery hit the
-  // final-attempt poll-timeout branch and refunded. Detect that here:
-  // skip the gallery write AND the state write, still ack, log loudly.
-  // Ops metric: 'result arrived after refund' counts the bounded orphan
-  // class — RD delivered the result we already paid for and refunded.
-  const preRaw = await env.SPRITEBREW_KV.get(stateKey);
-  const pre = preRaw ? (JSON.parse(preRaw) as JobState) : null;
-  if (pre?.status === 'error') {
-    log('error', 'result arrived after refund', {
-      preExistingErrorCode: pre.errorCode,
-      preExistingRefunded: pre.refunded,
-      rdBalanceCost: result.balance_cost,
-    });
-    // Ledger (ruling wd2 003): the rarest and most expensive outcome. RD did
-    // the work and billed it, the customer was already refunded, and nobody
-    // received the image. Own dedupe key; the terminal key belongs to the
-    // failure row that got here first.
+  // 1. Read the row: finished means the orphan path (no publish), ack.
+  const before = await readJobRow(env, jobId);
+  if (!before || before.finished_at_ms !== null) {
+    log('error', 'result arrived after the row finished', { outcome: before?.outcome ?? null, rdBalanceCost: result.balance_cost });
     await recordEvent(env, {
       eventName: 'generation.orphaned',
       level: 'error',
       dedupeKey: `${jobId}:generation.orphaned`,
-      userId,
-      jobId,
-      attempt: msg.attempts ?? 1,
+      userId, jobId, attempt,
       provider: PROVIDER,
       style: body.prompt_style,
       requestedSize: `${body.width}x${body.height}`,
       outcome: 'orphaned',
-      errorCode: pre.errorCode,
-      extra: { mode, preExistingRefunded: pre.refunded, rdBalanceCost: result.balance_cost },
+      extra: { mode, rowOutcome: before?.outcome ?? null, rdBalanceCost: result.balance_cost },
     }, log);
-    msg.ack();
-    return;
+    return ACK;
   }
-  if (pre?.status === 'success') {
-    // Redelivery re-race: another invocation already wrote success + gallery.
-    // Ack without duplicating the R2 write.
-    log('info', 'success state already recorded by concurrent invocation; acking');
-    msg.ack();
-    return;
-  }
-
-  // Gallery write FIRST (R2 PNG + KV gen: index). Tight nested try/catch:
-  // a failure here calls msg.retry() directly and MUST NOT fall through
-  // to the outer catch — the outer catch can refund tokens, and a
-  // post-RD failure on a generation RD already produced must not be
-  // double-refunded on the eventual retry.
+  // 2. Stage.
+  const st = await L.ownerUpdate(ctx, 'stage', { job: jobId, claim, meta: JSON.stringify(meta) });
+  if (st === 'ownership_lost') return ACK;
+  if (st === 'retry_message') return retryIn(null);
   try {
-    const pngBytes = base64ToBytes(result.base64_images[0]);
-    await writeGalleryEntry(
-      env,
-      {
-        jobId,
-        userId,
-        pngBytes,
-        prompt: body.prompt,
-        style: body.prompt_style,
-        mode,
-        createdAt: completedAt,
-        ...(rescue ? { rescued: true as const } : {}),
-      },
-      log
-    );
-  } catch (galleryErr) {
-    log('error', 'gallery write failed; retrying message', {
-      error: errText(galleryErr),
-    });
-    msg.retry();
-    return;
-  }
-
-  // Ledger: the one terminal row for this job. Same dedupe key as the
-  // failure row on purpose (a job has one terminal outcome; INSERT OR IGNORE
-  // keeps whichever landed first). Best-effort; cannot throw.
-  {
-    const requestedSize = `${body.width}x${body.height}`;
-    await recordEvent(env, {
-      eventName: rescue ? 'generation.rescued' : 'generation.succeeded',
-      level: 'info',
-      dedupeKey: `${jobId}:generation.terminal`,
-      userId,
-      jobId,
-      attempt: msg.attempts ?? 1,
-      provider: PROVIDER,
-      style: body.prompt_style,
-      requestedSize,
-      finalSize: rescue ? `${rescue.deliveredCellSize}x${rescue.deliveredCellSize}` : requestedSize,
-      outcome: rescue ? 'rescued' : 'succeeded',
-      latencyMs: completedAt - startedAt,
-      extra: { mode, rdBalanceCost: result.balance_cost, rescue },
-    }, log);
-  }
-
-  const successState: JobStateSuccess = {
-    status: 'success',
-    userId,
-    mode,
-    enqueuedAt: msg.body.enqueuedAt,
-    startedAt,
-    completedAt,
-    resultBase64: result.base64_images[0],
-    rdBalanceCost: result.balance_cost,
-    // Spread, not per-field assignment: on a normal success `rescue` is
-    // undefined and NOTHING is added, so the serialized record is unchanged.
-    ...(rescue ?? {}),
-  };
-  // writeStateUnlessTerminal covers the very-narrow race where a
-  // concurrent invocation transitioned to terminal between the pre-check
-  // above and here. Rare but possible: the pre-check is milliseconds ago,
-  // the write is milliseconds from now, both interleavable across two
-  // Workers. Terminal state (either success or error) wins.
-  await writeStateUnlessTerminal(env, stateKey, successState, log);
-
-  msg.ack();
-}
-
-async function recordFailure(
-  env: Env,
-  msg: Message<JobMessage>,
-  startedAt: number,
-  err: unknown,
-  errorCode: string,
-  log: Logger
-): Promise<void> {
-  const { jobId, userId, mode, tokenCost } = msg.body;
-  const stateKey = `job:${jobId}`;
-  const errMsg = errText(err);
-  const attempt = msg.attempts ?? 1;
-
-  // Money paused (n1-ledger 005 section 4): no refund now. Record that one is
-  // owed, then retry; guard 0f makes it once money reopens. Nothing is
-  // acked, so the message (or its dead letter) carries the debt.
-  if (await isMoneyPaused(env)) {
-    const delaySeconds = await pausedRetryDelayS(env);
-    const owed: JobStateRunning = {
-      status: 'running',
-      userId,
-      mode,
-      enqueuedAt: msg.body.enqueuedAt,
-      startedAt,
-      attempt,
-      tokenCost,
-      refundDue: { errorCode, at: Date.now(), error: errMsg.slice(0, 500) },
-    };
-    try {
-      await writeStateUnlessTerminal(env, stateKey, owed, log);
-    } catch (writeErr) {
-      // The retry still carries the debt; 0f or the dead-letter handler
-      // settles it from the message.
-      log('error', 'refund-due record write failed', { error: errText(writeErr) });
+    // 3. The PNG, durably.
+    const durable = await stagePng(env, userId, jobId, base64ToBytes(result.base64_images[0]), log);
+    if (!durable) {
+      // 4. It cannot be made durable: the owner's refund, result_store_failed.
+      return ownerFails(env, jobId, claim, 'result_store_failed', 'the result could not be stored', {
+        attempt, queueMessageId: msg.id, ctx: messageContext(msg.body), latencyMs: completedAt - times.startedAt,
+      }, log);
     }
-    log('warn', 'money paused; refund deferred', { errorCode, delaySeconds });
-    msg.retry({ delaySeconds });
-    return;
-  }
-
-  try {
-    // Generation context rides on the tx row's KV metadata so the admin
-    // failure-rate scan can bucket refunds by style without a get() per key.
-    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId, {
-      style: msg.body.body.prompt_style,
-      mode,
-      size: msg.body.body.width,
+    // 5. The success update.
+    const s = await successOrDoubt(env, jobId, claim, rescue ? 'rescued' : 'succeeded');
+    if (s === 'paused') {
+      log('warn', 'result staged durably while money is paused; retrying later', {});
+      return retryIn(await pausedRetryDelayS(env));
+    }
+    if (s === 'error') return retryIn(null);
+    if (s === 'ownership_lost') {
+      log('error', 'success update lost its claim; nothing published', {});
+      await recordEvent(env, {
+        eventName: 'generation.orphaned',
+        level: 'error',
+        dedupeKey: `${jobId}:generation.orphaned`,
+        userId, jobId, attempt,
+        provider: PROVIDER,
+        style: body.prompt_style,
+        outcome: 'orphaned',
+        extra: { mode, stage: 'success_update' },
+      }, log);
+      return ACK;
+    }
+    // 6 to 8.
+    const requestedSize = `${body.width}x${body.height}`;
+    return await publishAndRecord(env, jobId, meta, log, {
+      attempt, requestedSize, finalSize: rescue ? `${rescue.deliveredCellSize}x${rescue.deliveredCellSize}` : requestedSize,
     });
-    log('info', 'refund applied', {
-      alreadyApplied: refundResult.alreadyApplied,
-      newBalance: refundResult.newBalance,
-      errorCode,
-    });
-
-    // Ledger: terminal failure, then the refund that followed it. Both
-    // best-effort and idempotent; neither can throw, so the refund-then-
-    // terminal-state sequence around them is unchanged. `retryable` uses the
-    // same rule as the catch in handleMessage.
-    const failedEventId = await recordEvent(env, {
-      eventName: 'generation.failed',
-      level: 'error',
-      dedupeKey: `${jobId}:generation.terminal`,
-      userId,
-      jobId,
-      attempt,
-      provider: PROVIDER,
-      style: msg.body.body.prompt_style,
-      requestedSize: `${msg.body.body.width}x${msg.body.body.height}`,
-      outcome: 'failed',
-      errorCode,
-      failureStage: stageForErrorCode(errorCode),
-      retryable: err instanceof RdError ? err.retryable : true,
-      refundExpected: true,
-      latencyMs: Date.now() - startedAt,
-      extra: { mode, errMsg: errMsg.slice(0, 500) },
-    }, log);
-    await recordEvent(env, {
-      eventName: 'generation.refunded',
-      level: 'info',
-      dedupeKey: `${jobId}:generation.refunded`,
-      userId,
-      jobId,
-      unitsDelta: tokenCost,
-      causedByEventId: failedEventId ?? undefined,
-      extra: { alreadyApplied: refundResult.alreadyApplied, newBalance: refundResult.newBalance },
-    }, log);
-
-    const errorState: JobStateError = {
-      status: 'error',
-      userId,
-      mode,
-      enqueuedAt: msg.body.enqueuedAt,
-      failedAt: Date.now(),
-      error: errMsg,
-      errorCode,
-      attempts: attempt,
-      refunded: !refundResult.alreadyApplied,
-    };
-    // Reference startedAt for latency telemetry when useful (kept in log
-    // rather than in the state record — schema stays byte-identical).
-    log('info', 'terminal failure recorded', {
-      errorCode,
-      latencyMs: Date.now() - startedAt,
-    });
-    // writeStateUnlessTerminal: if a concurrent invocation already wrote
-    // 'success' (RD result arrived between our refund and this write), we
-    // must NOT overwrite that success with an error record. Success wins.
-    await writeStateUnlessTerminal(env, stateKey, errorState, log);
-
-    msg.ack();
-  } catch (refundErr) {
-    const refundErrMsg = errText(refundErr);
-    log('error', 'refund failed; retrying message', { refundErrMsg });
-    // If the refund itself fails (e.g., transient KV blip), retry the whole
-    // message. Idempotency on token_idempotency:refund:{jobId} ensures no
-    // double-refund on the next attempt.
-    msg.retry();
+  } catch (err) {
+    // After the stage: never the owner's refund (A4). The message returns.
+    log('error', 'after staging, a step threw; retrying (the staged row is finalized later)', { error: errText(err).slice(0, 300) });
+    return retryIn(null);
   }
 }
 
@@ -1223,200 +782,72 @@ function classifyError(err: unknown): string {
   return 'consumer_unknown';
 }
 
-// ─── Stale-running sweep (cron reconciler) ─────────────────────────────────
-
-const SWEEP_KEY_PREFIX = 'job:';
-const SWEEP_STALE_AFTER_MS = 20 * 60 * 1000;  // 20 min — well past any legitimate run
-const SWEEP_MAX_PER_RUN = 200;                // cap refunds/run so the cron stays short
-const SWEEP_MAX_PAGES = 10;                   // cap list pages examined/run (≤10k keys)
+// ─── The sweep (5.3, 4.12) and the repair pass (4.11) ─────────────────────
 
 /**
- * Reconcile records the queue path left stuck 'running'. The create isolate-
- * kill orphan (§investigation) never reaches recordFailure, so nothing refunds
- * it and it silently expires at the 1h TTL. This sweep is the backstop: any
- * 'running' record older than SWEEP_STALE_AFTER_MS is terminal-failed through
- * the SAME refund helper a caught error uses.
- *
- * Safety:
- *   - refundTokens is idempotent on token_idempotency:refund:{jobId}, so a
- *     record the queue path is ALSO about to refund can't be double-refunded.
- *   - the error state is written via writeStateUnlessTerminal, so a success or
- *     error a concurrent invocation just committed is never clobbered.
- *   - only 'running' records are touched; terminal records are skipped.
- *
- * Listing: the Worker runtime KV list API (env.SPRITEBREW_KV.list), NOT the
- * wrangler CLI — CLI prefix listing is unreliable on Windows PowerShell, but
- * the runtime API is fine. Prefix 'job:'. We page with the returned cursor,
- * bounded by SWEEP_MAX_PAGES and SWEEP_MAX_PER_RUN so a run can't grow long.
+ * The cron: 4.12's candidates replace release 1's KV listing, its refundOwed
+ * branch and sweepOne. The paused early return stays for the settling part;
+ * the repair pass follows on every run (its status writes settle nothing,
+ * and it waits only for the migrator's phase, 4.11).
  */
-async function sweepStaleRunning(env: Env): Promise<void> {
-  const now = Date.now();
+async function sweep(env: Env): Promise<void> {
   const log: Logger = (level, message, extra = {}) =>
-    console[level](JSON.stringify({ level, message, source: 'stale-running-sweep', ...extra }));
-
-  // Every sweep action is a refund: none while money is paused.
-  if (await isMoneyPaused(env)) {
-    log('info', 'money paused; sweep skipped');
-    return;
-  }
-
-  log('info', 'sweep started', {
-    staleAfterMs: SWEEP_STALE_AFTER_MS,
-    maxPerRun: SWEEP_MAX_PER_RUN,
-  });
-
-  let processed = 0;
-  let examined = 0;
-  let cursor: string | undefined;
-
-  for (let page = 0; page < SWEEP_MAX_PAGES; page++) {
-    const listing = await env.SPRITEBREW_KV.list({ prefix: SWEEP_KEY_PREFIX, cursor });
-
-    for (const key of listing.keys) {
-      if (processed >= SWEEP_MAX_PER_RUN) break;
-      examined++;
-
-      const raw = await env.SPRITEBREW_KV.get(key.name);
-      if (!raw) continue;  // expired between list and get
-
-      let st: JobState;
-      try {
-        st = JSON.parse(raw) as JobState;
-      } catch {
-        continue;  // unparseable — leave it; not ours to guess at
-      }
-
-      const jobId = key.name.slice(SWEEP_KEY_PREFIX.length);
-
-      // A refund the Pages enqueue catch could not confirm (n1-ledger-02.md
-      // 002 rulings B and C): a terminal error record still owing it.
-      if (st.status === 'error' && st.refundOwed && st.refunded !== true) {
-        const owedAgeMs = now - st.failedAt;
-        if (owedAgeMs <= SWEEP_STALE_AFTER_MS) continue;
-        try {
-          const settled = await settleRefundOwed(env, jobId, st, 'sweep', log);
-          log('info', 'refund owed by Pages settled', {
-            jobId, userId: st.userId, evidence: settled.evidence, ageMs: owedAgeMs, newBalance: settled.newBalance,
-          });
-        } catch (err) {
-          log('error', 'refund owed by Pages not settled; leaving for next run', {
-            jobId, userId: st.userId, ageMs: owedAgeMs, error: errText(err),
-          });
-        }
-        processed++;
-        continue;
-      }
-
-      if (st.status !== 'running') continue;         // never touch other terminal/pending records
-      // A refund owed from a paused failure or a paused dead letter (ruling
-      // A.3) ages from when it was owed; any other running record from its start.
-      const ageMs = now - (st.refundDue ? st.refundDue.at : st.startedAt);
-      if (ageMs <= SWEEP_STALE_AFTER_MS) continue;    // still plausibly in flight
-
-      await sweepOne(env, jobId, st, ageMs, log);
-      processed++;
+    console[level](JSON.stringify({ level, message, source: 'sweep', ...extra }));
+  try {
+    if (await isMoneyPaused(env)) {
+      log('info', 'money paused; sweep candidates skipped');
+    } else {
+      await sweepCandidates(env, log);
     }
-
-    if (listing.list_complete || processed >= SWEEP_MAX_PER_RUN) break;
-    cursor = listing.cursor;
+  } catch (err) {
+    log('error', 'sweep failed; the next run retries', { error: errText(err).slice(0, 300) });
   }
-
-  log('info', 'sweep complete', { processed, examined });
+  try {
+    const counts = await repairPass(env, log);
+    log('info', 'repair pass', { ...counts });
+  } catch (err) {
+    log('error', 'repair pass failed; the next run retries', { error: errText(err).slice(0, 300) });
+  }
 }
 
-/**
- * Terminal-fail one stale 'running' record: refund (idempotent) then write the
- * error state (terminal-guarded). A failure here is logged and left for the
- * next run rather than throwing — one bad record must not abort the batch.
- */
-async function sweepOne(
-  env: Env,
-  jobId: string,
-  state: JobStateRunning,
-  ageMs: number,
-  log: Logger
-): Promise<void> {
-  const { userId, mode, tokenCost } = state;
-
-  // Records written before tokenCost was persisted can't be refunded a correct
-  // amount from state alone. They expire at the 1h TTL; skip with a loud note.
-  if (typeof tokenCost !== 'number') {
-    log('warn', 'stale running record has no tokenCost; cannot refund (legacy pre-sweep record); skipping', {
-      jobId,
-      userId,
-      mode,
-      ageMs,
-    });
-    return;
+async function sweepCandidates(env: Env, log: Logger): Promise<void> {
+  const ctx = ledgerCtx(env);
+  const rows = await L.sweepList(ctx);
+  const done: Record<string, number> = {};
+  for (const r of rows) {
+    const job = await readJobRow(env, String(r.job_id));
+    if (!job) continue;
+    const candidate = L.sweepCandidate(r);
+    // Every generation.failed the sweep writes: the debit's style and size,
+    // and the row's age apart from its latency (finding 4 and 6).
+    const ev = { ctx: await debitContext(env, job.job_id), ageMs: Date.now() - job.created_at_ms };
+    try {
+      if (candidate === 6) {
+        const claim = `sweep:${crypto.randomUUID()}`;
+        const c = await L.claimJob(ctx, 'finalize', { job: job.job_id, claim, attempt: 0 });
+        if (c.outcome === 'won') await finishStaged(env, job, claim, ev, log);
+      } else if (candidate === 3 || candidate === 4 || (candidate === 2 && job.provenance === 'kv')) {
+        await deliveredChecks(env, job, ev, log);
+      } else if (candidate === 1) {
+        const code = 'debited_never_enqueued';
+        const res = await refundTokens(env, { job: job.job_id, fence: 'recovery', code }, log);
+        await afterCanceller(env, job, res, code, ev, log);
+      } else if (candidate === 5) {
+        const code = 'enqueued_never_claimed';
+        const res = await refundTokens(env, { job: job.job_id, fence: 'canceller', code }, log);
+        if (res.outcome === 'refunded') await ledgerAlarm(env, 'enqueued_never_claimed', job.job_id, { amount: res.amount }, log, job.user_id);
+        await afterCanceller(env, job, res, code, ev, log);
+      } else {
+        const code = 'stale_running_swept';
+        const res = await refundTokens(env, { job: job.job_id, fence: 'canceller', code }, log);
+        await afterCanceller(env, job, res, code, ev, log);
+      }
+      done[`candidate_${candidate}`] = (done[`candidate_${candidate}`] ?? 0) + 1;
+    } catch (err) {
+      log('error', 'sweep candidate failed; left for the next run', { jobId: job.job_id, candidate, error: errText(err).slice(0, 300) });
+    }
   }
-
-  const stateKey = `${SWEEP_KEY_PREFIX}${jobId}`;
-  // A record left owing a refund from a paused failure keeps its own code.
-  const errorCode = state.refundDue?.errorCode ?? 'stale_running_swept';
-  try {
-    // The running record carries mode but not style/size (the message is not
-    // in hand during a cron sweep), so the tx metadata gets mode only.
-    const refundResult = await refundTokens(env.SPRITEBREW_KV, userId, tokenCost, jobId, { mode });
-
-    // Ledger: the same terminal pair recordFailure writes. No style or size
-    // here (the sweep has the running record, not the message).
-    const failedEventId = await recordEvent(env, {
-      eventName: 'generation.failed',
-      level: 'error',
-      dedupeKey: `${jobId}:generation.terminal`,
-      userId,
-      jobId,
-      attempt: state.attempt,
-      provider: PROVIDER,
-      outcome: 'failed',
-      errorCode,
-      failureStage: stageForErrorCode(errorCode),
-      retryable: false,
-      refundExpected: true,
-      latencyMs: ageMs,
-      extra: { mode, ageMs },
-    }, log);
-    await recordEvent(env, {
-      eventName: 'generation.refunded',
-      level: 'info',
-      dedupeKey: `${jobId}:generation.refunded`,
-      userId,
-      jobId,
-      unitsDelta: tokenCost,
-      causedByEventId: failedEventId ?? undefined,
-      extra: { alreadyApplied: refundResult.alreadyApplied, newBalance: refundResult.newBalance },
-    }, log);
-
-    const errorState: JobStateError = {
-      status: 'error',
-      userId,
-      mode,
-      enqueuedAt: state.enqueuedAt,
-      failedAt: Date.now(),
-      error: state.refundDue?.error ?? `stale running record swept after ${Math.round(ageMs / 1000)}s`,
-      errorCode,
-      attempts: state.attempt,
-      refunded: !refundResult.alreadyApplied,
-    };
-    await writeStateUnlessTerminal(env, stateKey, errorState, log);
-
-    log('info', 'stale running record swept', {
-      jobId,
-      userId,
-      mode,
-      ageMs,
-      alreadyRefunded: refundResult.alreadyApplied,
-      newBalance: refundResult.newBalance,
-    });
-  } catch (err) {
-    log('error', 'stale-running sweep failed for record; leaving for next run', {
-      jobId,
-      userId,
-      mode,
-      ageMs,
-      error: errText(err),
-    });
-  }
+  log('info', 'sweep complete', { listed: rows.length, ...done });
 }
 
 // ─── Provider status probe (cron, WD2a) ──────────────────────────────────

@@ -151,7 +151,7 @@ export function digestHtml(d: DigestData, environment: string): string {
   const parts: string[] = [];
 
   parts.push(`<h1 ${H1}>SpriteBrew Daily ${esc(d.day)}${environment === 'production' ? '' : ` <span ${MUTED_SPAN}>[${esc(environment)}]</span>`}</h1>`);
-  parts.push(`<p ${MUTED}>Reporting day ${esc(d.day)} America/New_York. Generated ${esc(nyDateTime(d.generatedAtMs))} from the ${esc(environment)} event ledger. Money truth stays in the KV token ledger; this is observability.</p>`);
+  parts.push(`<p ${MUTED}>Reporting day ${esc(d.day)} America/New_York. Generated ${esc(nyDateTime(d.generatedAtMs))} from the ${esc(environment)} event ledger. Money truth is the D1 ledger, spritebrew-ledger; this is observability.</p>`);
 
   // 0. Missed digests: the one case where a missing email reaches nobody.
   for (const m of d.missed) {

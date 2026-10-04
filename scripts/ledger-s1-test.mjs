@@ -1716,9 +1716,15 @@ for (const [label, v, key] of PAUSE_VARIANTS) {
 {
   const db = fresh();
   check('T27', "after 0003 the control rows hold money_pause '0', the phase '0' and the sentinel", JSON.stringify(ctl(db)) === JSON.stringify({ migration_open: '0', money_pause: '0', switch_at_ms: '99999999999999' }));
-  const idx = await build({ entryPoints: [path.join(ROOT, 'src/index.ts')], bundle: true, platform: 'neutral', format: 'esm', write: false, logLevel: 'error', metafile: true });
-  const inputs = Object.keys(idx.metafile.inputs);
-  check('T27', 'no release 1 consumer path imports the library: the queue, scheduled and dead-letter handlers bundle without src/ledger.ts', !inputs.some((f) => /src[\\/]ledger\.ts$/.test(f)));
+  // From S3 the consumer's handlers use the library, so dev isolation before
+  // S5 rests on S3 not being deployed to dev (section 11). What every slice
+  // keeps: no source file but the library and the migrator's spec statements
+  // writes a money table or a control row.
+  const writers = (await import('node:fs')).readdirSync(path.join(ROOT, 'src'), { recursive: true })
+    .filter((f) => String(f).endsWith('.ts') && !/^(ledger|migrator)\.ts$/.test(String(f)))
+    .filter((f) => /(INSERT INTO|UPDATE|DELETE FROM)\s+(ledger|balances|jobs|legacy_idem|stripe_pending|switch_\w+|backstop_runs|charge_recovered|control)\b/
+      .test(readFileSync(path.join(ROOT, 'src', String(f)), 'utf8')));
+  check('T27', 'no consumer source but the library and the migrator writes a money table or a control row', writers.length === 0);
   const src = readFileSync(path.join(ROOT, 'src/ledger.ts'), 'utf8');
   check('T27', 'the library binds no queue and sends nothing (no .send, no Queue type)', !/\.send\(|\bQueue\b|sendBatch/.test(src));
   check('T27', "the library writes no control row except 4.15's and 4.16's own statements",

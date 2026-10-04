@@ -45,6 +45,10 @@ export interface JobStatePending {
   enqueuedAt: number;
 }
 
+/** Release 2's `running` record (n1-release-2-spec.md revision 9, 4.10):
+ *  best effort, for the status route only. It never carries `tokenCost`,
+ *  `refundDue`, a task or a rescue marker: the `jobs` row holds the claim, the
+ *  task and the phase, and release 1's payable shapes are retired (6.1). */
 export interface JobStateRunning {
   status: 'running';
   userId: string;
@@ -52,69 +56,6 @@ export interface JobStateRunning {
   enqueuedAt: number;
   startedAt: number;
   attempt: number;
-  /**
-   * Tokens to refund if this job has to be terminal-failed. Copied from the
-   * queue message onto the running record so an OUT-OF-BAND reconciler (the
-   * stale-running cron sweep) can refund the correct amount without the
-   * message in hand — the message only exists inside a queue invocation.
-   * Optional: records written before this field existed parse without it, and
-   * the sweep skips any record lacking it (they expire at the 1h TTL anyway).
-   */
-  tokenCost?: number;
-  /**
-   * Set immediately BEFORE the async submit fetch fires (animate/async path
-   * only). Purpose is redelivery-safety billing: if a message is redelivered
-   * and this marker is present but taskId is absent, the previous invocation
-   * threw during submit — RD may or may not have created a task, and there
-   * is no recovery path (probe: GET /v1/inferences/tasks returns 404, no
-   * listing endpoint; RD documents no idempotency keys). We MUST NOT
-   * resubmit. Absent on the create path (which is still sync).
-   */
-  submitAttemptedAt?: number;
-  /**
-   * Create path only. Set by the invocation that ran the RD call, after the
-   * call returned a retryable error and just before msg.retry(), so the next
-   * delivery knows no invocation is still inside the call and runs at once
-   * instead of being deferred by the legacy-running guard. A fresh running
-   * write never carries it.
-   */
-  releasedAt?: number;
-  /**
-   * Set immediately AFTER the async submit response yields a task_id
-   * (animate/async path only). On redelivery with this present + no terminal
-   * status, resume polling this exact task; do not resubmit.
-   */
-  taskId?: string;
-  /**
-   * RESCUE MARKER (July 16). Present iff `taskId` refers to a FALLBACK task
-   * rather than a primary one. Written in the same put as the fallback's
-   * taskId, because the fact that we're rescuing is only known in
-   * runAnimateAsync's local scope — if the invocation dies mid-poll, a
-   * redelivery resuming this task would otherwise deliver a silently
-   * downgraded 64px sheet with no notice, which is exactly what marking
-   * rescues is meant to prevent.
-   *
-   * deliveredFrames is deliberately NOT here: it depends on the sheet that
-   * hasn't arrived yet, and is computed at success time on whichever
-   * invocation actually receives it.
-   */
-  rescue?: {
-    requestedWidth: number;
-    requestedHeight: number;
-    deliveredCellSize: number;
-  };
-  /**
-   * A refund owed but not made because money writes were paused
-   * (n1-ledger.md 005 section 4). Written by recordFailure instead of the
-   * refund; the next delivery (guard 0f), the sweep or the dead-letter
-   * handler makes the refund once money reopens. The job never runs again.
-   */
-  refundDue?: {
-    errorCode: string;
-    at: number;
-    /** The failure's message, for the error record written with the refund. */
-    error?: string;
-  };
 }
 
 export interface JobStateSuccess {
@@ -164,25 +105,10 @@ export interface JobStateError {
   errorCode?: string;
   attempts: number;
   refunded: boolean;
-  /**
-   * Written by the Pages enqueue catch when its compensating refund could not
-   * be confirmed (n1-ledger-02.md 002 rulings B and C). The stale-running
-   * sweep or the dead-letter handler settles it from evidence
-   * (src/refundOwed.ts): no credit when `balanceWritten` is true or the Pages
-   * refund key exists, else one refund keyed on the job. Removed, with
-   * `refunded: true` and `refundSettled`, from both copies once settled.
-   */
-  refundOwed?: {
-    tokenCost: number;
-    reason: string;
-    requestId: string;
-    /** Pages' key for this refund, `refund:{requestId}` (KV `token_idempotency:` + this). */
-    idempotencyKey: string;
-    /** creditTokens finished its balance write before failing: the tokens already moved. */
-    balanceWritten: boolean;
-  };
-  /** Who settled `refundOwed` and from what evidence (n1-ledger-02.md 006 ruling A). */
-  refundSettled?: { by: 'sweep' | 'dead_letter'; at: number; evidence: string };
+  /** The refunded amount (4.11), on a record release 2 wrote. */
+  refundedAmount?: number;
+  /** A `no_record` tombstone's honest unresolved record (A9, 4.10). */
+  unresolved?: true;
 }
 
 export type JobState =

@@ -2,8 +2,11 @@
 //
 // The one writer for the D1 event ledger (WD2a, 2026-09-19).
 //
-// STANDING RULE: the token_tx:* KV ledger is the money truth. This table is
-// observability. A ledger write must never block, delay by more than a few
+// STANDING RULE: the D1 ledger `spritebrew-ledger` is the money truth (release
+// 2; n1-release-2-spec.md revision 9, 6.1). This table is observability. The
+// `ledger.alarm` rows (O8) carry the kind in error_code: zero_alarm, no_record,
+// debit_missing, enqueued_never_claimed, index_only, hold, repair_overdue,
+// unfinished_overdue, unique_mismatch; they are best effort, never money proof. A ledger write must never block, delay by more than a few
 // hundred milliseconds, or fail a job. recordEvent therefore:
 //   - wraps everything in try/catch and NEVER throws;
 //   - logs 'ledger write failed' at warn and returns null on any failure;
