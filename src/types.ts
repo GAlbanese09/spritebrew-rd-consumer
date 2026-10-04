@@ -206,6 +206,9 @@ export interface Env {
   /** 'production' | 'dev', from [env.*.vars] in wrangler.toml. Stamped on
    *  every ledger row because bindings alone do not say which env this is. */
   APP_ENV: string;
+  /** The migrator's bearer token (S2, 4.17): a secret, set only for the switch
+   *  (`wrangler secret put MIGRATE_TOKEN`). Unset, every migrator path is 404. */
+  MIGRATE_TOKEN?: string;
   RETRO_DIFFUSION_API_KEY: string;
   /** Morning digest (WD2b). RESEND_API_KEY and DIGEST_TO are Worker secrets
    *  (`wrangler secret put`, per environment); DIGEST_TO is a comma-separated

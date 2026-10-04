@@ -76,6 +76,7 @@ import { recordEvent, stageForErrorCode } from './events';
 import { putJobState, writeStateUnlessTerminal } from './jobState';
 import { runDigestIfDue } from './digest';
 import { DEAD_LETTER_QUEUES, handleDeadLetter } from './deadLetter';
+import { handleMigrator } from './migrator';
 import { isMoneyPaused, pausedRetryDelayS } from './moneyPause';
 import { settleRefundOwed } from './refundOwed';
 
@@ -272,6 +273,11 @@ function taskIdFromPollError(err: unknown): string | undefined {
 }
 
 export default {
+  // The migrator (S2, 6.1): token-gated, exact POST paths, uniform 404; in
+  // phase '0' only the read-only scan?verify=1 answers.
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return handleMigrator(request, env);
+  },
   async queue(batch: MessageBatch<JobMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
     // Dead letters: exact queue names only (deadLetter.ts).
     if (DEAD_LETTER_QUEUES.has(batch.queue)) {
